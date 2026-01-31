@@ -1,0 +1,13 @@
+{
+  "ignorePatterns": [
+    {
+      "pattern": "^https://pkg.go.dev"
+    },
+    {
+      "pattern": "^https://github.com/aas-core-works/aas-package3-golang"
+    }
+  ],
+  "retryOn429": true,
+  "retryCount": 3,
+  "fallbackRetryDelay": "30s"
+}
