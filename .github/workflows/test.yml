@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Go ${{ matrix.go-version }}
         uses: actions/setup-go@v5
@@ -45,7 +45,7 @@ jobs:
   #   needs: test
   #   steps:
   #     - name: Check out code
-  #       uses: actions/checkout@v4
+  #       uses: actions/checkout@v6
 
   #     - name: Set up Go
   #       uses: actions/setup-go@v5
