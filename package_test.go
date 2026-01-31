@@ -1306,7 +1306,7 @@ func TestPutPart(t *testing.T) {
 	}
 
 	if part == nil {
-		t.Error("Expected part but got nil")
+		t.Fatal("Expected part but got nil")
 	}
 	if part.ContentType != "text/plain" {
 		t.Errorf("Expected content type text/plain, got %s", part.ContentType)

@@ -673,7 +673,8 @@ func (p *PackageRead) Thumbnail() (*Part, error) {
 	// Look for thumbnail relationship from root
 	rels := p.base.getRelationshipsByType("", RelationTypeThumbnail)
 
-	for _, rel := range rels {
+	if len(rels) > 0 {
+		rel := rels[0]
 		normalizedTarget := normalizePathForMap(rel.target)
 		if part, ok := p.base.parts[normalizedTarget]; ok {
 			return part, nil
@@ -992,7 +993,7 @@ func normalizeURI(uri *url.URL) string {
 		return ""
 	}
 	path := uri.Path
-	if uri.String() != "" && !strings.HasPrefix(uri.String(), "/") && strings.HasPrefix(uri.String(), "/") == false {
+	if uri.String() != "" && !strings.HasPrefix(uri.String(), "/") {
 		path = "/" + uri.String()
 	}
 	return normalizePathForMap(path)
