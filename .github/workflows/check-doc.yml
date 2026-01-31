@@ -26,8 +26,10 @@ jobs:
 
       - name: Check that documentation builds
         run: |
-          # Verify that go doc can parse the package
-          go doc -all ./... > /dev/null
+          # Verify that go doc can parse all packages
+          for pkg in $(go list ./...); do
+            go doc -all "$pkg" > /dev/null
+          done
 
       - name: Check for broken links in markdown
         uses: gaurav-nelson/github-action-markdown-link-check@v1
