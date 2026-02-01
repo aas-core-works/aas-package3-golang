@@ -478,12 +478,16 @@ func (pkg *packageBase) addRelationship(sourcePath, targetPath, relType string) 
 }
 
 func (pkg *packageBase) addRelationshipWithID(sourcePath, targetPath, relType, id string) string {
+	return pkg.addRelationshipWithIDAndMode(sourcePath, targetPath, relType, id, "Internal")
+}
+
+func (pkg *packageBase) addRelationshipWithIDAndMode(sourcePath, targetPath, relType, id, targetMode string) string {
 	normalizedSource := normalizePathForMap(sourcePath)
 	rel := relationship{
 		id:         id,
 		relType:    relType,
 		target:     targetPath,
-		targetMode: "Internal",
+		targetMode: targetMode,
 	}
 	pkg.relationships[normalizedSource] = append(pkg.relationships[normalizedSource], rel)
 	return id
@@ -882,9 +886,10 @@ func (p *PackageReadWrite) writeToZip(w io.Writer) error {
 		}
 		for _, rel := range rels {
 			relsXML.Relationships = append(relsXML.Relationships, relationshipXML{
-				ID:     rel.id,
-				Type:   rel.relType,
-				Target: rel.target,
+				ID:         rel.id,
+				Type:       rel.relType,
+				Target:     rel.target,
+				TargetMode: rel.targetMode,
 			})
 		}
 
