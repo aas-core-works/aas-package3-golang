@@ -34,8 +34,9 @@ func FuzzPathHelpers(f *testing.F) {
 		sourcePath := getSourcePathFromRelsPath(relsPath)
 		resolved := resolveRelativeURI(sourcePath, target)
 		if target != "" && strings.HasPrefix(target, "/") {
-			if resolved != target {
-				t.Fatalf("expected absolute target to remain unchanged, got %q", resolved)
+			expected := strings.ReplaceAll(target, "\\", "/")
+			if resolved != expected {
+				t.Fatalf("expected absolute target to remain unchanged except slash normalization, got %q", resolved)
 			}
 		} else {
 			if resolved != "" && !strings.HasPrefix(resolved, "/") {
