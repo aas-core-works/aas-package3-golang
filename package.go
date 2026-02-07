@@ -175,12 +175,26 @@ func (p *Packaging) Create(path string) (*PackageReadWrite, error) {
 	// Create relationship from root to origin
 	pkg.addRelationship("", originURI.String(), RelationTypeAasxOrigin)
 
-	return &PackageReadWrite{
+	result := &PackageReadWrite{
 		PackageRead: PackageRead{
 			Path: path,
 			base: pkg,
 		},
-	}, nil
+	}
+
+	specs, err := result.Specs()
+	Ensure(err == nil, "Specs must be readable in a new package.")
+	Ensure(len(specs) == 0, "Specs must be empty in a new package.")
+
+	supplementaries, err := result.SupplementaryRelationships()
+	Ensure(err == nil, "Supplementaries must be readable in a new package.")
+	Ensure(len(supplementaries) == 0, "There must be no supplementary relationships in a new package.")
+
+	thumbnail, err := result.Thumbnail()
+	Ensure(err == nil, "Thumbnail must be readable in a new package.")
+	Ensure(thumbnail == nil, "There must be no thumbnail in a new package.")
+
+	return result, nil
 }
 
 // CreateInStream creates a new AAS package in the given stream.
@@ -203,12 +217,26 @@ func (p *Packaging) CreateInStream(stream io.ReadWriteSeeker) (*PackageReadWrite
 	// Create relationship from root to origin
 	pkg.addRelationship("", originURI.String(), RelationTypeAasxOrigin)
 
-	return &PackageReadWrite{
+	result := &PackageReadWrite{
 		PackageRead: PackageRead{
 			Path: "",
 			base: pkg,
 		},
-	}, nil
+	}
+
+	specs, err := result.Specs()
+	Ensure(err == nil, "Specs must be readable in a new package.")
+	Ensure(len(specs) == 0, "Specs must be empty in a new package.")
+
+	supplementaries, err := result.SupplementaryRelationships()
+	Ensure(err == nil, "Supplementaries must be readable in a new package.")
+	Ensure(len(supplementaries) == 0, "There must be no supplementary relationships in a new package.")
+
+	thumbnail, err := result.Thumbnail()
+	Ensure(err == nil, "Thumbnail must be readable in a new package.")
+	Ensure(thumbnail == nil, "There must be no thumbnail in a new package.")
+
+	return result, nil
 }
 
 // OpenRead opens an AAS package at the given path for reading.
@@ -227,10 +255,14 @@ func (p *Packaging) OpenRead(path string) (*PackageRead, error) {
 	}
 	pkg.readWrite = false
 
-	return &PackageRead{
+	result := &PackageRead{
 		Path: path,
 		base: pkg,
-	}, nil
+	}
+
+	Ensure(result.Path == path, "The Path property of the package must match the input path.")
+
+	return result, nil
 }
 
 // OpenReadFromStream opens an AAS package from the given stream for reading.
@@ -258,10 +290,14 @@ func (p *Packaging) OpenReadFromStream(stream io.ReadSeeker) (*PackageRead, erro
 	}
 	pkg.readWrite = false
 
-	return &PackageRead{
+	result := &PackageRead{
 		Path: "",
 		base: pkg,
-	}, nil
+	}
+
+	Ensure(result.Path == "", "The Path property of the package must be empty if reading from a stream.")
+
+	return result, nil
 }
 
 // OpenReadWrite opens an AAS package at the given path for read/write.
@@ -280,12 +316,16 @@ func (p *Packaging) OpenReadWrite(path string) (*PackageReadWrite, error) {
 	}
 	pkg.readWrite = true
 
-	return &PackageReadWrite{
+	result := &PackageReadWrite{
 		PackageRead: PackageRead{
 			Path: path,
 			base: pkg,
 		},
-	}, nil
+	}
+
+	Ensure(result.Path == path, "The Path property of the package must match the input path.")
+
+	return result, nil
 }
 
 // OpenReadWriteFromStream opens an AAS package from the given stream for read/write.
@@ -314,12 +354,16 @@ func (p *Packaging) OpenReadWriteFromStream(stream io.ReadWriteSeeker) (*Package
 	pkg.readWrite = true
 	pkg.stream = stream
 
-	return &PackageReadWrite{
+	result := &PackageReadWrite{
 		PackageRead: PackageRead{
 			Path: "",
 			base: pkg,
 		},
-	}, nil
+	}
+
+	Ensure(result.Path == "", "The Path property of the package must be empty if read/writing to a stream.")
+
+	return result, nil
 }
 
 // openFromReader opens an OPC package from a reader
@@ -587,6 +631,13 @@ func (p *PackageRead) SpecsByContentType() (map[string][]*Part, error) {
 		})
 	}
 
+	for contentType, specs := range result {
+		for _, spec := range specs {
+			Ensure(spec.ContentType == contentType, "The content type of spec must match its group.")
+		}
+		Ensure(len(specs) > 0, "Every entry in the result must contain non-empty specs.")
+	}
+
 	return result, nil
 }
 
@@ -721,6 +772,12 @@ func (p *PackageReadWrite) PutPart(uri *url.URL, contentType string, content []b
 
 	p.base.parts[normalizedURI] = part
 
+	stored := p.base.parts[normalizedURI]
+	Ensure(stored != nil, "The part should be included in the package.")
+	if stored != nil {
+		Ensure(bytes.Equal(stored.content, content), "Input content and re-read content must coincide on put.")
+	}
+
 	return part, nil
 }
 
@@ -741,6 +798,9 @@ func (p *PackageReadWrite) DeletePart(part *Part) error {
 	normalizedURI := normalizeURI(part.URI)
 	delete(p.base.parts, normalizedURI)
 
+	_, exists := p.base.parts[normalizedURI]
+	Ensure(!exists, "The part should not exist in the package anymore.")
+
 	return nil
 }
 
@@ -755,6 +815,16 @@ func (p *PackageReadWrite) MakeSpec(part *Part) error {
 	}
 
 	p.base.addRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+
+	listed := p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	if listed {
+		_, exists := p.base.parts[normalizeURI(part.URI)]
+		listed = exists
+	}
+	Ensure(listed, "Spec must be listed.")
+
+	isSpec := p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	Ensure(isSpec, "The part fulfills the spec property.")
 	return nil
 }
 
@@ -763,14 +833,54 @@ func (p *PackageReadWrite) UnmakeSpec(part *Part) error {
 	p.base.mu.Lock()
 	defer p.base.mu.Unlock()
 
+	isSpec := p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	Require(isSpec, "The part fulfills the spec property.")
+
+	oldSpecURISet := make(map[string]struct{})
+	for _, rel := range p.base.getRelationshipsByType(p.base.originURI, RelationTypeAasxSpec) {
+		normalizedTarget := normalizePathForMap(rel.target)
+		if _, ok := p.base.parts[normalizedTarget]; ok {
+			oldSpecURISet[normalizedTarget] = struct{}{}
+		}
+	}
+
 	p.base.removeRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+
+	newSpecURISet := make(map[string]struct{})
+	for _, rel := range p.base.getRelationshipsByType(p.base.originURI, RelationTypeAasxSpec) {
+		normalizedTarget := normalizePathForMap(rel.target)
+		if _, ok := p.base.parts[normalizedTarget]; ok {
+			newSpecURISet[normalizedTarget] = struct{}{}
+		}
+	}
+
+	Ensure(func() bool {
+		_, exists := newSpecURISet[normalizeURI(part.URI)]
+		return !exists
+	}(), "The spec must not be listed in the Specs().")
+
+	_, existed := oldSpecURISet[normalizeURI(part.URI)]
+	if existed {
+		Ensure(len(newSpecURISet) == len(oldSpecURISet)-1, "No other spec has been removed.")
+		removed := 0
+		for uri := range oldSpecURISet {
+			if _, ok := newSpecURISet[uri]; !ok {
+				removed++
+				Ensure(uri == normalizeURI(part.URI), "No other spec has been removed.")
+			}
+		}
+		Ensure(removed == 1, "No other spec has been removed.")
+	}
 	return nil
 }
 
-// RelateSupplementaryToSpec creates a supplementary relationship between a spec and a supplementary part.
-func (p *PackageReadWrite) RelateSupplementaryToSpec(spec *Part, supplementary *Part) error {
+// RelateSupplementaryToSpec creates a supplementary relationship between a supplementary part and a spec.
+func (p *PackageReadWrite) RelateSupplementaryToSpec(supplementary *Part, spec *Part) error {
 	p.base.mu.Lock()
 	defer p.base.mu.Unlock()
+
+	isSpec := p.base.hasRelationship(p.base.originURI, spec.URI.String(), RelationTypeAasxSpec)
+	Require(isSpec, "The part fulfills the spec property.")
 
 	// Check if relationship already exists
 	if p.base.hasRelationship(spec.URI.String(), supplementary.URI.String(), RelationTypeAasxSupplementary) {
@@ -778,15 +888,59 @@ func (p *PackageReadWrite) RelateSupplementaryToSpec(spec *Part, supplementary *
 	}
 
 	p.base.addRelationship(spec.URI.String(), supplementary.URI.String(), RelationTypeAasxSupplementary)
+
+	relExists := p.base.hasRelationship(spec.URI.String(), supplementary.URI.String(), RelationTypeAasxSupplementary)
+	if relExists {
+		_, exists := p.base.parts[normalizeURI(supplementary.URI)]
+		relExists = exists
+	}
+	Ensure(relExists, "The supplementary must be listed.")
 	return nil
 }
 
 // UnrelateSupplementaryFromSpec removes the supplementary relationship.
-func (p *PackageReadWrite) UnrelateSupplementaryFromSpec(spec *Part, supplementary *Part) error {
+func (p *PackageReadWrite) UnrelateSupplementaryFromSpec(supplementary *Part, spec *Part) error {
 	p.base.mu.Lock()
 	defer p.base.mu.Unlock()
 
+	isSpec := p.base.hasRelationship(p.base.originURI, spec.URI.String(), RelationTypeAasxSpec)
+	Require(isSpec, "The part fulfills the spec property.")
+
+	oldSupplURISet := make(map[string]struct{})
+	for _, rel := range p.base.getRelationshipsByType(spec.URI.String(), RelationTypeAasxSupplementary) {
+		normalizedTarget := normalizePathForMap(rel.target)
+		if _, ok := p.base.parts[normalizedTarget]; ok {
+			oldSupplURISet[normalizedTarget] = struct{}{}
+		}
+	}
+
 	p.base.removeRelationship(spec.URI.String(), supplementary.URI.String(), RelationTypeAasxSupplementary)
+
+	newSupplURISet := make(map[string]struct{})
+	for _, rel := range p.base.getRelationshipsByType(spec.URI.String(), RelationTypeAasxSupplementary) {
+		normalizedTarget := normalizePathForMap(rel.target)
+		if _, ok := p.base.parts[normalizedTarget]; ok {
+			newSupplURISet[normalizedTarget] = struct{}{}
+		}
+	}
+
+	Ensure(func() bool {
+		_, exists := newSupplURISet[normalizeURI(supplementary.URI)]
+		return !exists
+	}(), "The supplementary file must not be listed in the Supplementaries().")
+
+	_, existed := oldSupplURISet[normalizeURI(supplementary.URI)]
+	if existed {
+		Ensure(len(newSupplURISet) == len(oldSupplURISet)-1, "No other supplementary has been removed.")
+		removed := 0
+		for uri := range oldSupplURISet {
+			if _, ok := newSupplURISet[uri]; !ok {
+				removed++
+				Ensure(uri == normalizeURI(supplementary.URI), "No other supplementary has been removed.")
+			}
+		}
+		Ensure(removed == 1, "No other supplementary has been removed.")
+	}
 	return nil
 }
 
@@ -803,6 +957,17 @@ func (p *PackageReadWrite) SetThumbnail(part *Part) error {
 
 	// Add new thumbnail relationship
 	p.base.addRelationship("", part.URI.String(), RelationTypeThumbnail)
+
+	thumbnailRels := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	Ensure(len(thumbnailRels) > 0, "The thumbnail must be available.")
+	if len(thumbnailRels) > 0 {
+		normalizedTarget := normalizePathForMap(thumbnailRels[0].target)
+		stored, exists := p.base.parts[normalizedTarget]
+		Ensure(exists, "The thumbnail must point to the part.")
+		if exists {
+			Ensure(normalizeURI(stored.URI) == normalizeURI(part.URI), "The thumbnail must point to the part.")
+		}
+	}
 	return nil
 }
 
@@ -815,6 +980,9 @@ func (p *PackageReadWrite) UnsetThumbnail() error {
 	for _, rel := range rels {
 		p.base.removeRelationship("", rel.target, RelationTypeThumbnail)
 	}
+
+	remaining := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	Ensure(len(remaining) == 0, "The thumbnail must not exist any more")
 	return nil
 }
 

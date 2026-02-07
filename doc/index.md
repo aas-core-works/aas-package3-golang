@@ -18,10 +18,3 @@ The documentation is split in three sections:
 * [API Documentation](api/index.md) provides an overview of the package API, types, and functions.
 
 * [Contributing](contributing/intro.md) explains how to set up the development environment, run tests, and submit your contribution.
-
-## Related Projects
-
-This library is part of the [aas-core-works](https://github.com/aas-core-works) project family:
-
-- [aas-package3-csharp](https://github.com/aas-core-works/aas-package3-csharp) - C# implementation
-- [aas-core3.0-golang](https://github.com/aas-core-works/aas-core3.0-golang) - AAS meta-model in Go

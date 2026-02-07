@@ -369,7 +369,7 @@ func TestReadSupplementaries(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to put supplementary part: %v", err)
 		}
-		if err := pkg.RelateSupplementaryToSpec(specPart, supplPart); err != nil {
+		if err := pkg.RelateSupplementaryToSpec(supplPart, specPart); err != nil {
 			t.Fatalf("Failed to relate supplementary to spec: %v", err)
 		}
 
@@ -1092,7 +1092,7 @@ func TestAddSupplementaryFileToNewPackage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to put supplementary part: %v", err)
 		}
-		if err := pkg.RelateSupplementaryToSpec(specPart, supplPart); err != nil {
+		if err := pkg.RelateSupplementaryToSpec(supplPart, specPart); err != nil {
 			t.Fatalf("Failed to relate supplementary: %v", err)
 		}
 
@@ -1600,7 +1600,7 @@ func TestRelateSupplementaryToSpec(t *testing.T) {
 		t.Fatalf("Failed to put supplementary: %v", err)
 	}
 
-	if err := pkg.RelateSupplementaryToSpec(specPart, supplPart); err != nil {
+	if err := pkg.RelateSupplementaryToSpec(supplPart, specPart); err != nil {
 		t.Fatalf("Failed to relate supplementary to spec: %v", err)
 	}
 
@@ -1659,7 +1659,7 @@ func TestUnrelateSupplementaryFromSpec(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to put suppl: %v", err)
 		}
-		if err := pkg.RelateSupplementaryToSpec(specPart, supplPart); err != nil {
+		if err := pkg.RelateSupplementaryToSpec(supplPart, specPart); err != nil {
 			t.Fatalf("Failed to relate: %v", err)
 		}
 
@@ -1687,7 +1687,7 @@ func TestUnrelateSupplementaryFromSpec(t *testing.T) {
 			t.Fatalf("Failed to get suppl: %v", err)
 		}
 
-		if err := pkg.UnrelateSupplementaryFromSpec(specPart, supplPart); err != nil {
+		if err := pkg.UnrelateSupplementaryFromSpec(supplPart, specPart); err != nil {
 			t.Fatalf("Failed to unrelate: %v", err)
 		}
 		if err := pkg.Flush(); err != nil {
@@ -2461,7 +2461,7 @@ func TestDeletingASupplementary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to put suppl: %v", err)
 		}
-		if err := pkg.RelateSupplementaryToSpec(specPart, supplPart); err != nil {
+		if err := pkg.RelateSupplementaryToSpec(supplPart, specPart); err != nil {
 			t.Fatalf("Failed to relate: %v", err)
 		}
 
@@ -2469,7 +2469,7 @@ func TestDeletingASupplementary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to put another suppl: %v", err)
 		}
-		if err := pkg.RelateSupplementaryToSpec(specPart, anotherSupplPart); err != nil {
+		if err := pkg.RelateSupplementaryToSpec(anotherSupplPart, specPart); err != nil {
 			t.Fatalf("Failed to relate: %v", err)
 		}
 
@@ -2497,7 +2497,7 @@ func TestDeletingASupplementary(t *testing.T) {
 			t.Fatalf("Failed to get spec: %v", err)
 		}
 
-		if err := pkg.UnrelateSupplementaryFromSpec(specPart, supplPart); err != nil {
+		if err := pkg.UnrelateSupplementaryFromSpec(supplPart, specPart); err != nil {
 			t.Fatalf("Failed to unrelate: %v", err)
 		}
 		if err := pkg.DeletePart(supplPart); err != nil {
