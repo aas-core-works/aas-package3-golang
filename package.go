@@ -1230,6 +1230,9 @@ func getRelsPath(sourcePath string) string {
 
 // resolveRelativeURI resolves a relative URI against a source path
 func resolveRelativeURI(sourcePath, target string) string {
+	if strings.Contains(target, "\\") {
+		target = strings.ReplaceAll(target, "\\", "/")
+	}
 	if strings.HasPrefix(target, "/") {
 		return target
 	}
@@ -1242,6 +1245,7 @@ func resolveRelativeURI(sourcePath, target string) string {
 
 	resolved := filepath.Join(sourceDir, target)
 	resolved = filepath.ToSlash(resolved)
+	resolved = strings.ReplaceAll(resolved, "\\", "/")
 	if !strings.HasPrefix(resolved, "/") {
 		resolved = "/" + resolved
 	}
