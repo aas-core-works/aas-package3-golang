@@ -38,6 +38,9 @@ jobs:
       - name: Run tests
         run: go test -v -race ./...
 
+      - name: Run tests with DBC
+        run: go test -v -race -tags debug ./...
+
   # TODO: Enable coverage job once secret is set up
   # coverage:
   #   name: Coverage
