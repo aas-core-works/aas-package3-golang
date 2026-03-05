@@ -38,8 +38,8 @@ jobs:
       - name: Run tests
         run: go test -v -race ./...
 
-      - name: Run tests with DBC
-        run: go test -v -race -tags debug ./...
+      - name: Run tests with DBC and coverage
+        run: go test -v -race -tags debug -covermode atomic -coverprofile=covprofile ./...
 
       - name: Run fuzz tests (short)
         run: |
@@ -47,27 +47,12 @@ jobs:
           go test -run=^$ -fuzz=FuzzOpenReadFromBytes -fuzztime=5s -tags debug ./...
           go test -run=^$ -fuzz=FuzzRoundTripPackage -fuzztime=5s -tags debug ./...
 
-  # TODO: Enable coverage job once secret is set up
-  # coverage:
-  #   name: Coverage
-  #   runs-on: ubuntu-latest
-  #   needs: test
-  #   steps:
-  #     - name: Check out code
-  #       uses: actions/checkout@v6
+      - name: Install goveralls
+        if: matrix.go-version == '1.18'
+        run: go install github.com/mattn/goveralls@latest
 
-  #     - name: Set up Go
-  #       uses: actions/setup-go@v6
-  #       with:
-  #         go-version: '1.18'
-
-  #     - name: Install goveralls
-  #       run: go install github.com/mattn/goveralls@latest
-
-  #     - name: Run tests with coverage
-  #       run: go test -covermode atomic -coverprofile=covprofile ./...
-
-  #     - name: Send coverage to Coveralls
-  #       env:
-  #         COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  #       run: goveralls -coverprofile=covprofile -service=github
+      - name: Send coverage to Coveralls
+        if: matrix.go-version == '1.18'
+        env:
+          COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: goveralls -coverprofile=covprofile -service=github
