@@ -40,9 +40,7 @@ var (
 	ErrInvalidFormat = errors.New("invalid package format")
 )
 
-// =============================================================================
-// OPC XML Types
-// =============================================================================
+// region OPC XML Types
 
 // relationshipsXML represents a .rels file in an OPC package
 type relationshipsXML struct {
@@ -87,9 +85,9 @@ type relationship struct {
 	targetMode string
 }
 
-// =============================================================================
-// Part
-// =============================================================================
+// endregion
+
+// region Part
 
 // Part represents a part of an AAS package.
 type Part struct {
@@ -130,9 +128,9 @@ type SupplementaryRelationship struct {
 	Supplementary *Part
 }
 
-// =============================================================================
-// Packaging
-// =============================================================================
+// endregion
+
+// region Packaging
 
 // Packaging provides methods to open and create AAS packages.
 type Packaging struct{}
@@ -489,9 +487,9 @@ func (p *Packaging) openFromReader(reader *bytes.Reader, size int64, path string
 	return pkg, nil
 }
 
-// =============================================================================
-// PackageBase (internal)
-// =============================================================================
+// endregion
+
+// region PackageBase (internal)
 
 // packageBase holds the internal state of a package
 type packageBase struct {
@@ -574,9 +572,9 @@ func (pkg *packageBase) hasRelationship(sourcePath, targetPath, relType string) 
 	return false
 }
 
-// =============================================================================
-// PackageRead
-// =============================================================================
+// endregion
+
+// region PackageRead
 
 // PackageRead provides read-only access to an AAS package.
 type PackageRead struct {
@@ -740,9 +738,9 @@ func (p *PackageRead) Thumbnail() (*Part, error) {
 	return nil, nil
 }
 
-// =============================================================================
-// PackageReadWrite
-// =============================================================================
+// endregion
+
+// region PackageReadWrite
 
 // PackageReadWrite provides read and write access to an AAS package.
 // It embeds PackageRead for read functionality.
@@ -1156,9 +1154,9 @@ func (p *PackageReadWrite) buildContentTypes() contentTypesXML {
 	return ct
 }
 
-// =============================================================================
-// Helper Functions
-// =============================================================================
+// endregion
+
+// region Helper Functions
 
 // normalizeURI returns a normalized string representation of a URI for use as map key
 func normalizeURI(uri *url.URL) string {
@@ -1252,3 +1250,5 @@ func resolveRelativeURI(sourcePath, target string) string {
 
 	return resolved
 }
+
+// endregion
