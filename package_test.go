@@ -1,7 +1,9 @@
 package aasx
 
 import (
+	"archive/zip"
 	"bytes"
+	"encoding/xml"
 	"io"
 	"net/url"
 	"os"
@@ -33,6 +35,107 @@ func mustParseURL(rawURL string) *url.URL {
 		panic(err)
 	}
 	return u
+}
+
+func relationshipTypesInZip(t *testing.T, zipData []byte) []string {
+	t.Helper()
+
+	reader, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		t.Fatalf("Failed to open zip: %v", err)
+	}
+
+	var result []string
+	for _, file := range reader.File {
+		if filepath.Ext(file.Name) != ".rels" {
+			continue
+		}
+
+		rc, err := file.Open()
+		if err != nil {
+			t.Fatalf("Failed to open rels file %s: %v", file.Name, err)
+		}
+
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatalf("Failed to read rels file %s: %v", file.Name, err)
+		}
+
+		var rels relationshipsXML
+		if err := xml.Unmarshal(data, &rels); err != nil {
+			t.Fatalf("Failed to parse rels file %s: %v", file.Name, err)
+		}
+
+		for _, rel := range rels.Relationships {
+			result = append(result, rel.Type)
+		}
+	}
+
+	return result
+}
+
+func rewriteRelationshipTypesInZip(
+	t *testing.T,
+	zipData []byte,
+	replacements map[string]string,
+) []byte {
+	t.Helper()
+
+	reader, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		t.Fatalf("Failed to open zip: %v", err)
+	}
+
+	var out bytes.Buffer
+	writer := zip.NewWriter(&out)
+
+	for _, file := range reader.File {
+		rc, err := file.Open()
+		if err != nil {
+			t.Fatalf("Failed to open zip entry %s: %v", file.Name, err)
+		}
+
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatalf("Failed to read zip entry %s: %v", file.Name, err)
+		}
+
+		if filepath.Ext(file.Name) == ".rels" {
+			var rels relationshipsXML
+			if err := xml.Unmarshal(data, &rels); err != nil {
+				t.Fatalf("Failed to parse rels file %s: %v", file.Name, err)
+			}
+
+			for i := range rels.Relationships {
+				if replacement, ok := replacements[rels.Relationships[i].Type]; ok {
+					rels.Relationships[i].Type = replacement
+				}
+			}
+
+			data, err = xml.MarshalIndent(rels, "", "  ")
+			if err != nil {
+				t.Fatalf("Failed to marshal rels file %s: %v", file.Name, err)
+			}
+			data = append([]byte(xml.Header), data...)
+		}
+
+		entryWriter, err := writer.Create(file.Name)
+		if err != nil {
+			t.Fatalf("Failed to create zip entry %s: %v", file.Name, err)
+		}
+
+		if _, err := entryWriter.Write(data); err != nil {
+			t.Fatalf("Failed to write zip entry %s: %v", file.Name, err)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close zip writer: %v", err)
+	}
+
+	return out.Bytes()
 }
 
 // =============================================================================
@@ -406,6 +509,222 @@ func TestReadSupplementaries(t *testing.T) {
 		if !bytes.Equal(content, supplContent) {
 			t.Errorf("Content mismatch: expected %s, got %s", supplContent, content)
 		}
+	}
+}
+
+func TestReadSpecsSupportsDeprecatedRelationshipType(t *testing.T) {
+	packaging := NewPackaging()
+
+	stream := &readWriteSeeker{buf: &bytes.Buffer{}}
+	pkg, err := packaging.CreateInStream(stream)
+	if err != nil {
+		t.Fatalf("Failed to create package: %v", err)
+	}
+
+	_, err = pkg.PutPart(
+		mustParseURL("/aasx/some-company/data.txt"),
+		"text/plain",
+		[]byte("some content"),
+	)
+	if err != nil {
+		t.Fatalf("Failed to put part: %v", err)
+	}
+
+	spec, err := pkg.MustPart(mustParseURL("/aasx/some-company/data.txt"))
+	if err != nil {
+		t.Fatalf("Failed to get part: %v", err)
+	}
+
+	if err := pkg.MakeSpec(spec); err != nil {
+		t.Fatalf("Failed to make spec: %v", err)
+	}
+
+	if err := pkg.Flush(); err != nil {
+		t.Fatalf("Failed to flush package: %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+
+	zipData := rewriteRelationshipTypesInZip(t, stream.buf.Bytes(), map[string]string{
+		RelationTypeAasxSpec: DeprecatedAasxRelationshipsPrefix + "aas-spec",
+	})
+
+	readPkg, err := packaging.OpenReadFromStream(bytes.NewReader(zipData))
+	if err != nil {
+		t.Fatalf("Failed to open package: %v", err)
+	}
+	defer readPkg.Close()
+
+	specs, err := readPkg.Specs()
+	if err != nil {
+		t.Fatalf("Failed to read specs: %v", err)
+	}
+
+	if len(specs) != 1 {
+		t.Fatalf("Expected 1 spec, got %d", len(specs))
+	}
+}
+
+func TestReadSupplementariesSupportsDeprecatedRelationshipType(t *testing.T) {
+	packaging := NewPackaging()
+
+	stream := &readWriteSeeker{buf: &bytes.Buffer{}}
+	pkg, err := packaging.CreateInStream(stream)
+	if err != nil {
+		t.Fatalf("Failed to create package: %v", err)
+	}
+
+	specPart, err := pkg.PutPart(
+		mustParseURL("/aasx/some-company/data.txt"),
+		"text/plain",
+		[]byte("spec content"),
+	)
+	if err != nil {
+		t.Fatalf("Failed to put spec part: %v", err)
+	}
+	if err := pkg.MakeSpec(specPart); err != nil {
+		t.Fatalf("Failed to make spec: %v", err)
+	}
+
+	supplPart, err := pkg.PutPart(
+		mustParseURL("/aasx/some-company/suppl.txt"),
+		"text/plain",
+		[]byte("supplementary content"),
+	)
+	if err != nil {
+		t.Fatalf("Failed to put supplementary part: %v", err)
+	}
+	if err := pkg.RelateSupplementaryToSpec(supplPart, specPart); err != nil {
+		t.Fatalf("Failed to relate supplementary to spec: %v", err)
+	}
+
+	if err := pkg.Flush(); err != nil {
+		t.Fatalf("Failed to flush package: %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+
+	zipData := rewriteRelationshipTypesInZip(t, stream.buf.Bytes(), map[string]string{
+		RelationTypeAasxSpec:          DeprecatedAasxRelationshipsPrefix + "aas-spec",
+		RelationTypeAasxSupplementary: DeprecatedAasxRelationshipsPrefix + "aas-suppl",
+	})
+
+	readPkg, err := packaging.OpenReadFromStream(bytes.NewReader(zipData))
+	if err != nil {
+		t.Fatalf("Failed to open package: %v", err)
+	}
+	defer readPkg.Close()
+
+	rels, err := readPkg.SupplementaryRelationships()
+	if err != nil {
+		t.Fatalf("Failed to read supplementary relationships: %v", err)
+	}
+
+	if len(rels) != 1 {
+		t.Fatalf("Expected 1 supplementary relationship, got %d", len(rels))
+	}
+}
+
+func TestFlushPreservesDeprecatedAasxRelationshipTypes(t *testing.T) {
+	tmpdir, cleanup := temporaryDirectory(t)
+	defer cleanup()
+
+	packaging := NewPackaging()
+
+	stream := &readWriteSeeker{buf: &bytes.Buffer{}}
+	pkg, err := packaging.CreateInStream(stream)
+	if err != nil {
+		t.Fatalf("Failed to create package: %v", err)
+	}
+
+	specPart, err := pkg.PutPart(
+		mustParseURL("/aasx/some-company/data.txt"),
+		"text/plain",
+		[]byte("spec content"),
+	)
+	if err != nil {
+		t.Fatalf("Failed to put spec part: %v", err)
+	}
+	if err := pkg.MakeSpec(specPart); err != nil {
+		t.Fatalf("Failed to make spec: %v", err)
+	}
+
+	supplPart, err := pkg.PutPart(
+		mustParseURL("/aasx/some-company/suppl.txt"),
+		"text/plain",
+		[]byte("supplementary content"),
+	)
+	if err != nil {
+		t.Fatalf("Failed to put supplementary part: %v", err)
+	}
+	if err := pkg.RelateSupplementaryToSpec(supplPart, specPart); err != nil {
+		t.Fatalf("Failed to relate supplementary to spec: %v", err)
+	}
+
+	if err := pkg.Flush(); err != nil {
+		t.Fatalf("Failed to flush package: %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+
+	zipData := rewriteRelationshipTypesInZip(t, stream.buf.Bytes(), map[string]string{
+		RelationTypeAasxOrigin:        DeprecatedAasxRelationshipsPrefix + "aasx-origin",
+		RelationTypeAasxSpec:          DeprecatedAasxRelationshipsPrefix + "aas-spec",
+		RelationTypeAasxSupplementary: DeprecatedAasxRelationshipsPrefix + "aas-suppl",
+	})
+
+	pth := filepath.Join(tmpdir, "deprecated.aasx")
+	if err := os.WriteFile(pth, zipData, 0644); err != nil {
+		t.Fatalf("Failed to write test package: %v", err)
+	}
+
+	rwPkg, err := packaging.OpenReadWrite(pth)
+	if err != nil {
+		t.Fatalf("Failed to open package in read-write mode: %v", err)
+	}
+	if err := rwPkg.Flush(); err != nil {
+		t.Fatalf("Failed to flush package: %v", err)
+	}
+	if err := rwPkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+
+	flushedData, err := os.ReadFile(pth)
+	if err != nil {
+		t.Fatalf("Failed to read flushed package: %v", err)
+	}
+
+	types := relationshipTypesInZip(t, flushedData)
+	deprOrigin := DeprecatedAasxRelationshipsPrefix + "aasx-origin"
+	deprSpec := DeprecatedAasxRelationshipsPrefix + "aas-spec"
+	deprSuppl := DeprecatedAasxRelationshipsPrefix + "aas-suppl"
+
+	hasOrigin := false
+	hasSpec := false
+	hasSuppl := false
+	for _, relType := range types {
+		if relType == deprOrigin {
+			hasOrigin = true
+		}
+		if relType == deprSpec {
+			hasSpec = true
+		}
+		if relType == deprSuppl {
+			hasSuppl = true
+		}
+	}
+
+	if !hasOrigin {
+		t.Fatalf("Expected deprecated origin relationship type %q to be preserved", deprOrigin)
+	}
+	if !hasSpec {
+		t.Fatalf("Expected deprecated spec relationship type %q to be preserved", deprSpec)
+	}
+	if !hasSuppl {
+		t.Fatalf("Expected deprecated supplementary relationship type %q to be preserved", deprSuppl)
 	}
 }
 
