@@ -1259,6 +1259,10 @@ func normalizeRelationshipType(relType string) string {
 	return relType
 }
 
+// relationshipTypesEqual checks the relationship types for equality based on their
+// normalized forms (see `normalizeRelationshipType`). Namely, we want the equality
+// to be agnostic to legacy and current relationship type prefixes, so we normalize them
+// before equality comparison.
 func relationshipTypesEqual(left, right string) bool {
 	return normalizeRelationshipType(left) == normalizeRelationshipType(right)
 }
