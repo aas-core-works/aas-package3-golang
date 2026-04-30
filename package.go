@@ -21,9 +21,12 @@ import (
 
 // Relation types used in AASX packages.
 const (
-	RelationTypeAasxOrigin        = "http://admin-shell.io/aasx/relationships/aasx-origin"
-	RelationTypeAasxSpec          = "http://admin-shell.io/aasx/relationships/aas-spec"
-	RelationTypeAasxSupplementary = "http://admin-shell.io/aasx/relationships/aas-suppl"
+	PreferredAasxRelationshipsPrefix  = "http://admin-shell.io/aasx/relationships/"
+	DeprecatedAasxRelationshipsPrefix = "http://www.admin-shell.io/aasx/relationships/"
+
+	RelationTypeAasxOrigin        = PreferredAasxRelationshipsPrefix + "aasx-origin"
+	RelationTypeAasxSpec          = PreferredAasxRelationshipsPrefix + "aas-spec"
+	RelationTypeAasxSupplementary = PreferredAasxRelationshipsPrefix + "aas-suppl"
 	RelationTypeThumbnail         = "http://schemas.openxmlformats.org/package/2006" +
 		"/relationships/metadata/thumbnail"
 )
@@ -444,7 +447,7 @@ func (p *Packaging) openFromReader(
 				pkg.addRelationshipWithID(sourcePath, targetPath, rel.Type, rel.ID)
 
 				// Check if this is the origin relationship
-				if rel.Type == RelationTypeAasxOrigin && sourcePath == "" {
+				if relationshipTypesEqual(rel.Type, RelationTypeAasxOrigin) && sourcePath == "" {
 					pkg.originURI = normalizePathForMap(targetPath)
 				}
 			}
@@ -559,7 +562,7 @@ func (pkg *packageBase) removeRelationship(sourcePath, targetPath, relType strin
 	var newRels []relationship
 	for _, rel := range rels {
 		if !(normalizePathForMap(rel.target) == normalizedTarget &&
-			rel.relType == relType) {
+			relationshipTypesEqual(rel.relType, relType)) {
 			newRels = append(newRels, rel)
 		}
 	}
@@ -570,7 +573,7 @@ func (pkg *packageBase) getRelationshipsByType(sourcePath, relType string) []rel
 	normalizedSource := normalizePathForMap(sourcePath)
 	var result []relationship
 	for _, rel := range pkg.relationships[normalizedSource] {
-		if rel.relType == relType {
+		if relationshipTypesEqual(rel.relType, relType) {
 			result = append(result, rel)
 		}
 	}
@@ -582,7 +585,8 @@ func (pkg *packageBase) hasRelationship(sourcePath, targetPath, relType string) 
 	normalizedTarget := normalizePathForMap(targetPath)
 
 	for _, rel := range pkg.relationships[normalizedSource] {
-		if rel.relType == relType && normalizePathForMap(rel.target) == normalizedTarget {
+		if relationshipTypesEqual(rel.relType, relType) &&
+			normalizePathForMap(rel.target) == normalizedTarget {
 			return true
 		}
 	}
@@ -1239,6 +1243,28 @@ func normalizePathForMap(path string) string {
 	}
 	// Normalize to lowercase for case-insensitive comparison
 	return strings.ToLower(path)
+}
+
+// normalizeRelationshipType normalizes relationship type aliases to preferred forms.
+//
+// We replace deprecated relationships prefixes (since V3.0.1 of
+// the meta-model) with the newer relationship prefix. This allows us to support both the
+// legacy AASX files as well as the new version of AASX files. In particular, we use
+// the normalized form in the equality checks (see `relationshipTypesEqual`).
+func normalizeRelationshipType(relType string) string {
+	if strings.HasPrefix(relType, DeprecatedAasxRelationshipsPrefix) {
+		suffix := strings.TrimPrefix(relType, DeprecatedAasxRelationshipsPrefix)
+		return PreferredAasxRelationshipsPrefix + suffix
+	}
+	return relType
+}
+
+// relationshipTypesEqual checks the relationship types for equality based on their
+// normalized forms (see `normalizeRelationshipType`). Namely, we want the equality
+// to be agnostic to legacy and current relationship type prefixes, so we normalize them
+// before equality comparison.
+func relationshipTypesEqual(left, right string) bool {
+	return normalizeRelationshipType(left) == normalizeRelationshipType(right)
 }
 
 // getSourcePathFromRelsPath extracts the source path from a .rels file path
