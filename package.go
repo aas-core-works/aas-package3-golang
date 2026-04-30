@@ -1246,6 +1246,11 @@ func normalizePathForMap(path string) string {
 }
 
 // normalizeRelationshipType normalizes relationship type aliases to preferred forms.
+//
+// We replace deprecated relationships prefixes (since V3.0.1 of
+// the meta-model) with the newer relationship prefix. This allows us to support both the
+// legacy AASX files as well as the new version of AASX files. In particular, we use
+// the normalized form in the equality checks (see `relationshipTypesEqual`).
 func normalizeRelationshipType(relType string) string {
 	if strings.HasPrefix(relType, DeprecatedAasxRelationshipsPrefix) {
 		suffix := strings.TrimPrefix(relType, DeprecatedAasxRelationshipsPrefix)
