@@ -1240,6 +1240,16 @@ func normalizeURI(uri *url.URL) string {
 
 // normalizePathForMap normalizes a path for use as a map key
 func normalizePathForMap(path string) string {
+	path = normalizePathForURI(path)
+	if path == "" {
+		return ""
+	}
+
+	return strings.ToLower(path)
+}
+
+// normalizePathForURI normalizes an OPC URI-like path while preserving case.
+func normalizePathForURI(path string) string {
 	if path == "" {
 		return ""
 	}
@@ -1249,7 +1259,7 @@ func normalizePathForMap(path string) string {
 		path = "/" + path
 	}
 
-	path = strings.ToLower(pathpkg.Clean(path))
+	path = pathpkg.Clean(path)
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
@@ -1306,15 +1316,15 @@ func getSourcePathFromRelsPath(relsPath string) string {
 	dir = strings.TrimSuffix(dir, "/_rels")
 
 	if dir == "" || dir == "." || dir == "/" {
-		return normalizePathForMap("/" + sourceName)
+		return normalizePathForURI("/" + sourceName)
 	}
 
-	return normalizePathForMap(dir + "/" + sourceName)
+	return normalizePathForURI(dir + "/" + sourceName)
 }
 
 // getRelsPath returns the path to the .rels file for a given source path
 func getRelsPath(sourcePath string) string {
-	sourcePath = normalizePathForMap(sourcePath)
+	sourcePath = normalizePathForURI(sourcePath)
 	if sourcePath == "" {
 		return "/_rels/.rels"
 	}
@@ -1326,18 +1336,18 @@ func getRelsPath(sourcePath string) string {
 		return "/_rels/" + base + ".rels"
 	}
 
-	return normalizePathForMap(dir + "/_rels/" + base + ".rels")
+	return normalizePathForURI(dir + "/_rels/" + base + ".rels")
 }
 
 // resolveRelativeURI resolves a relative URI against a source path
 func resolveRelativeURI(sourcePath, target string) string {
 	target = strings.ReplaceAll(target, "\\", "/")
 	if strings.HasPrefix(target, "/") {
-		return normalizePathForMap(target)
+		return normalizePathForURI(target)
 	}
 
 	// Relative path - resolve against source directory
-	normalizedSource := normalizePathForMap(sourcePath)
+	normalizedSource := normalizePathForURI(sourcePath)
 	sourceDir := pathpkg.Dir(normalizedSource)
 	if sourceDir == "" || sourceDir == "." {
 		sourceDir = "/"
@@ -1348,7 +1358,7 @@ func resolveRelativeURI(sourcePath, target string) string {
 		resolved = "/" + resolved
 	}
 
-	return normalizePathForMap(resolved)
+	return normalizePathForURI(resolved)
 }
 
 // endregion

@@ -40,7 +40,6 @@ func FuzzPathHelpers(f *testing.F) {
 			if !strings.HasPrefix(expected, "/") {
 				expected = "/" + expected
 			}
-			expected = strings.ToLower(expected)
 			if resolved != expected {
 				t.Fatalf("expected canonical absolute target %q, got %q", expected, resolved)
 			}
