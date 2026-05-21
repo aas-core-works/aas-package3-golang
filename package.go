@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -423,7 +424,8 @@ func (p *Packaging) openFromReader(
 
 	// Read all relationships files
 	for _, file := range zipReader.File {
-		if strings.Contains(file.Name, "_rels/") && strings.HasSuffix(file.Name, ".rels") {
+		relsPath := strings.ReplaceAll(file.Name, "\\", "/")
+		if strings.Contains(relsPath, "_rels/") && strings.HasSuffix(relsPath, ".rels") {
 			rc, err := file.Open()
 			if err != nil {
 				return nil, fmt.Errorf("failed to open rels file %s: %w", file.Name, err)
@@ -440,7 +442,7 @@ func (p *Packaging) openFromReader(
 			}
 
 			// Determine source path from rels file path
-			sourcePath := getSourcePathFromRelsPath(file.Name)
+			sourcePath := getSourcePathFromRelsPath(relsPath)
 
 			for _, rel := range rels.Relationships {
 				targetPath := resolveRelativeURI(sourcePath, rel.Target)
@@ -461,9 +463,10 @@ func (p *Packaging) openFromReader(
 
 	// Read all parts (excluding rels files and content types)
 	for _, file := range zipReader.File {
-		if file.Name == "[Content_Types].xml" ||
-			strings.Contains(file.Name, "_rels/") ||
-			strings.HasSuffix(file.Name, "/") {
+		zipPath := strings.ReplaceAll(file.Name, "\\", "/")
+		if zipPath == "[Content_Types].xml" ||
+			strings.Contains(zipPath, "_rels/") ||
+			strings.HasSuffix(zipPath, "/") {
 			continue
 		}
 
@@ -477,7 +480,7 @@ func (p *Packaging) openFromReader(
 			return nil, fmt.Errorf("failed to read part %s: %w", file.Name, err)
 		}
 
-		partPath := "/" + file.Name
+		partPath := "/" + strings.TrimPrefix(zipPath, "/")
 		normalizedPath := normalizePathForMap(partPath)
 
 		// Determine content type
@@ -485,7 +488,7 @@ func (p *Packaging) openFromReader(
 		if ct, ok := contentTypes[normalizedPath]; ok {
 			contentType = ct
 		} else {
-			ext := strings.TrimPrefix(filepath.Ext(file.Name), ".")
+			ext := strings.TrimPrefix(pathpkg.Ext(zipPath), ".")
 			if ct, ok := defaultTypes[strings.ToLower(ext)]; ok {
 				contentType = ct
 			} else {
@@ -1237,12 +1240,35 @@ func normalizeURI(uri *url.URL) string {
 
 // normalizePathForMap normalizes a path for use as a map key
 func normalizePathForMap(path string) string {
-	// Ensure path starts with /
-	if path != "" && !strings.HasPrefix(path, "/") {
+	path = normalizePathForURI(path)
+	if path == "" {
+		return ""
+	}
+
+	return strings.ToLower(path)
+}
+
+// normalizePathForURI normalizes an OPC URI-like path while preserving case.
+func normalizePathForURI(path string) string {
+	if path == "" {
+		return ""
+	}
+
+	path = strings.ReplaceAll(path, "\\", "/")
+	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	// Normalize to lowercase for case-insensitive comparison
-	return strings.ToLower(path)
+
+	path = pathpkg.Clean(path)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	if path == "/." {
+		return "/"
+	}
+
+	return path
 }
 
 // normalizeRelationshipType normalizes relationship type aliases to preferred forms.
@@ -1271,71 +1297,68 @@ func relationshipTypesEqual(left, right string) bool {
 // e.g., "_rels/.rels" -> "" (root)
 // e.g., "aasx/_rels/aasx-origin.rels" -> "/aasx/aasx-origin"
 func getSourcePathFromRelsPath(relsPath string) string {
-	// Remove leading /
+	relsPath = strings.ReplaceAll(relsPath, "\\", "/")
 	relsPath = strings.TrimPrefix(relsPath, "/")
+	relsPath = pathpkg.Clean("/" + relsPath)
 
-	if relsPath == "_rels/.rels" {
+	if relsPath == "/_rels/.rels" {
 		return "" // Root relationships
 	}
 
 	// Extract directory and filename
-	dir := filepath.Dir(relsPath)
-	base := filepath.Base(relsPath)
+	dir := pathpkg.Dir(relsPath)
+	base := pathpkg.Base(relsPath)
 
 	// Remove .rels extension
 	sourceName := strings.TrimSuffix(base, ".rels")
 
 	// Remove _rels from path
 	dir = strings.TrimSuffix(dir, "/_rels")
-	dir = strings.TrimSuffix(dir, "_rels")
 
-	if dir == "" || dir == "." {
-		return "/" + sourceName
+	if dir == "" || dir == "." || dir == "/" {
+		return normalizePathForURI("/" + sourceName)
 	}
 
-	return "/" + dir + "/" + sourceName
+	return normalizePathForURI(dir + "/" + sourceName)
 }
 
 // getRelsPath returns the path to the .rels file for a given source path
 func getRelsPath(sourcePath string) string {
-	sourcePath = normalizePathForMap(sourcePath)
+	sourcePath = normalizePathForURI(sourcePath)
 	if sourcePath == "" {
 		return "/_rels/.rels"
 	}
 
-	dir := filepath.Dir(sourcePath)
-	base := filepath.Base(sourcePath)
+	dir := pathpkg.Dir(sourcePath)
+	base := pathpkg.Base(sourcePath)
 
 	if dir == "/" || dir == "." {
 		return "/_rels/" + base + ".rels"
 	}
 
-	return dir + "/_rels/" + base + ".rels"
+	return normalizePathForURI(dir + "/_rels/" + base + ".rels")
 }
 
 // resolveRelativeURI resolves a relative URI against a source path
 func resolveRelativeURI(sourcePath, target string) string {
-	if strings.Contains(target, "\\") {
-		target = strings.ReplaceAll(target, "\\", "/")
-	}
+	target = strings.ReplaceAll(target, "\\", "/")
 	if strings.HasPrefix(target, "/") {
-		return target
+		return normalizePathForURI(target)
 	}
 
 	// Relative path - resolve against source directory
-	sourceDir := filepath.Dir(sourcePath)
+	normalizedSource := normalizePathForURI(sourcePath)
+	sourceDir := pathpkg.Dir(normalizedSource)
 	if sourceDir == "" || sourceDir == "." {
 		sourceDir = "/"
 	}
 
-	resolved := filepath.Join(sourceDir, target)
-	resolved = filepath.ToSlash(resolved)
-	resolved = strings.ReplaceAll(resolved, "\\", "/")
+	resolved := pathpkg.Join(sourceDir, target)
 	if !strings.HasPrefix(resolved, "/") {
 		resolved = "/" + resolved
 	}
 
-	return resolved
+	return normalizePathForURI(resolved)
 }
 
 // endregion

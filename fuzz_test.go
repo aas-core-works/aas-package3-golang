@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net/url"
+	pathpkg "path"
 	"strings"
 	"testing"
 )
@@ -35,8 +36,12 @@ func FuzzPathHelpers(f *testing.F) {
 		resolved := resolveRelativeURI(sourcePath, target)
 		if target != "" && strings.HasPrefix(target, "/") {
 			expected := strings.ReplaceAll(target, "\\", "/")
+			expected = pathpkg.Clean(expected)
+			if !strings.HasPrefix(expected, "/") {
+				expected = "/" + expected
+			}
 			if resolved != expected {
-				t.Fatalf("expected absolute target to remain unchanged except slash normalization, got %q", resolved)
+				t.Fatalf("expected canonical absolute target %q, got %q", expected, resolved)
 			}
 		} else {
 			if resolved != "" && !strings.HasPrefix(resolved, "/") {
