@@ -138,6 +138,69 @@ func rewriteRelationshipTypesInZip(
 	return out.Bytes()
 }
 
+func rewriteRelationshipTargetsInZip(
+	t *testing.T,
+	zipData []byte,
+	replacements map[string]string,
+) []byte {
+	t.Helper()
+
+	reader, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		t.Fatalf("Failed to open zip: %v", err)
+	}
+
+	var out bytes.Buffer
+	writer := zip.NewWriter(&out)
+
+	for _, file := range reader.File {
+		rc, err := file.Open()
+		if err != nil {
+			t.Fatalf("Failed to open zip entry %s: %v", file.Name, err)
+		}
+
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatalf("Failed to read zip entry %s: %v", file.Name, err)
+		}
+
+		if filepath.Ext(file.Name) == ".rels" {
+			var rels relationshipsXML
+			if err := xml.Unmarshal(data, &rels); err != nil {
+				t.Fatalf("Failed to parse rels file %s: %v", file.Name, err)
+			}
+
+			for i := range rels.Relationships {
+				if replacement, ok := replacements[rels.Relationships[i].Target]; ok {
+					rels.Relationships[i].Target = replacement
+				}
+			}
+
+			data, err = xml.MarshalIndent(rels, "", "  ")
+			if err != nil {
+				t.Fatalf("Failed to marshal rels file %s: %v", file.Name, err)
+			}
+			data = append([]byte(xml.Header), data...)
+		}
+
+		entryWriter, err := writer.Create(file.Name)
+		if err != nil {
+			t.Fatalf("Failed to create zip entry %s: %v", file.Name, err)
+		}
+
+		if _, err := entryWriter.Write(data); err != nil {
+			t.Fatalf("Failed to write zip entry %s: %v", file.Name, err)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close zip writer: %v", err)
+	}
+
+	return out.Bytes()
+}
+
 // =============================================================================
 // TestPackageRead - Error Handling
 // =============================================================================
@@ -429,6 +492,61 @@ func TestReadSpecs(t *testing.T) {
 		if !bytes.Equal(content, originalContent) {
 			t.Errorf("Content mismatch: expected %s, got %s", originalContent, content)
 		}
+	}
+}
+
+func TestReadSpecsNormalizesWindowsLikeRelationshipTargets(t *testing.T) {
+	packaging := NewPackaging()
+
+	stream := &readWriteSeeker{buf: &bytes.Buffer{}}
+	pkg, err := packaging.CreateInStream(stream)
+	if err != nil {
+		t.Fatalf("Failed to create package: %v", err)
+	}
+
+	specPart, err := pkg.PutPart(
+		mustParseURL("/aasx/some-company/data.txt"),
+		"text/plain",
+		[]byte("some content"),
+	)
+	if err != nil {
+		t.Fatalf("Failed to put part: %v", err)
+	}
+	if err := pkg.MakeSpec(specPart); err != nil {
+		t.Fatalf("Failed to make spec: %v", err)
+	}
+
+	if err := pkg.Flush(); err != nil {
+		t.Fatalf("Failed to flush package: %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+
+	zipData := rewriteRelationshipTargetsInZip(t, stream.buf.Bytes(), map[string]string{
+		"/aasx/some-company/data.txt": `\aasx\\some-company\.\data.txt`,
+	})
+
+	readPkg, err := packaging.OpenReadFromStream(bytes.NewReader(zipData))
+	if err != nil {
+		t.Fatalf("Failed to open package: %v", err)
+	}
+	defer readPkg.Close()
+
+	specs, err := readPkg.Specs()
+	if err != nil {
+		t.Fatalf("Failed to read specs: %v", err)
+	}
+
+	if len(specs) != 1 {
+		t.Fatalf("Expected 1 spec after canonicalizing relationship target path, got %d", len(specs))
+	}
+}
+
+func TestGetSourcePathFromRelsPathNormalizesWindowsSeparators(t *testing.T) {
+	got := getSourcePathFromRelsPath(`aasx\_rels\aasx-origin.rels`)
+	if got != "/aasx/aasx-origin" {
+		t.Fatalf("Expected normalized source path /aasx/aasx-origin, got %q", got)
 	}
 }
 
