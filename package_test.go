@@ -64,6 +64,63 @@ type closeTrackingReaderAt struct {
 	closed bool
 }
 
+type observingReader struct {
+	reader      *bytes.Reader
+	maxReadSize int
+}
+
+func (reader *observingReader) Read(buffer []byte) (int, error) {
+	if len(buffer) > reader.maxReadSize {
+		reader.maxReadSize = len(buffer)
+	}
+	return reader.reader.Read(buffer)
+}
+
+type errorAfterReader struct {
+	content []byte
+	err     error
+}
+
+func (reader *errorAfterReader) Read(buffer []byte) (int, error) {
+	if len(reader.content) == 0 {
+		return 0, reader.err
+	}
+	read := copy(buffer, reader.content)
+	reader.content = reader.content[read:]
+	return read, nil
+}
+
+type switchFailWriter struct {
+	bytes.Buffer
+	fail   bool
+	closed bool
+	err    error
+}
+
+func (writer *switchFailWriter) Write(buffer []byte) (int, error) {
+	if writer.fail {
+		return 0, writer.err
+	}
+	return writer.Buffer.Write(buffer)
+}
+
+func (writer *switchFailWriter) Close() error {
+	writer.closed = true
+	return nil
+}
+
+func incompressibleTestContent(size int) []byte {
+	result := make([]byte, size)
+	state := uint32(0x12345678)
+	for index := range result {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		result[index] = byte(state)
+	}
+	return result
+}
+
 func (reader *closeTrackingReaderAt) Close() error {
 	reader.closed = true
 	return nil
@@ -1754,6 +1811,244 @@ func TestPartStream(t *testing.T) {
 		if !bytes.Equal(content, originalContent) {
 			t.Error("Content mismatch")
 		}
+	}
+}
+
+// =============================================================================
+// TestPackageWriter
+// =============================================================================
+
+func TestPackageWriterRoundTrip(t *testing.T) {
+	destination := &switchFailWriter{err: errors.New("destination failed")}
+	writer, err := NewPackaging().CreateWriter(destination)
+	if err != nil {
+		t.Fatalf("Failed to create streaming writer: %v", err)
+	}
+
+	specContent := []byte(`{"assetAdministrationShells":[]}`)
+	spec, err := writer.PutPartFromStream(
+		mustParseURL("/aasx/spec.json"),
+		"application/json",
+		bytes.NewReader(specContent),
+	)
+	if err != nil {
+		t.Fatalf("Failed to write spec: %v", err)
+	}
+	if _, err := spec.Stream(); !errors.Is(err, ErrWriteOnlyPart) {
+		t.Fatalf("Expected write-only part error, got %v", err)
+	}
+	if err := writer.MakeSpec(spec); err != nil {
+		t.Fatalf("Failed to make spec: %v", err)
+	}
+	if err := writer.MakeSpec(spec); err != nil {
+		t.Fatalf("Repeated MakeSpec failed: %v", err)
+	}
+
+	supplementaryContent := []byte("manual")
+	supplementary, err := writer.PutPartFromStream(
+		mustParseURL("/files/manual.json"),
+		"application/pdf",
+		bytes.NewReader(supplementaryContent),
+	)
+	if err != nil {
+		t.Fatalf("Failed to write supplementary: %v", err)
+	}
+	if err := writer.RelateSupplementaryToSpec(supplementary, spec); err != nil {
+		t.Fatalf("Failed to relate supplementary: %v", err)
+	}
+	if err := writer.RelateSupplementaryToSpec(supplementary, spec); err != nil {
+		t.Fatalf("Repeated supplementary relationship failed: %v", err)
+	}
+
+	thumbnailContent := []byte("thumbnail")
+	thumbnail, err := writer.PutPartFromStream(
+		mustParseURL("/thumbnail.png"),
+		"image/png",
+		bytes.NewReader(thumbnailContent),
+	)
+	if err != nil {
+		t.Fatalf("Failed to write thumbnail: %v", err)
+	}
+	if err := writer.SetThumbnail(thumbnail); err != nil {
+		t.Fatalf("Failed to set thumbnail: %v", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close streaming writer: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Repeated Close failed: %v", err)
+	}
+	if destination.closed {
+		t.Fatal("PackageWriter closed its caller-owned destination")
+	}
+	if _, err := writer.PutPartFromStream(
+		mustParseURL("/late.bin"), "application/octet-stream", bytes.NewReader(nil),
+	); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected ErrWriterClosed, got %v", err)
+	}
+
+	pkg, err := NewPackaging().OpenReadFromReaderAt(
+		bytes.NewReader(destination.Bytes()), int64(destination.Len()))
+	if err != nil {
+		t.Fatalf("Failed to open streaming output: %v", err)
+	}
+	defer pkg.Close()
+
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	storedSpec, err := specs[0].ReadAllBytes()
+	if err != nil || !bytes.Equal(storedSpec, specContent) {
+		t.Fatalf("Spec content mismatch: %v", err)
+	}
+	if specs[0].ContentType != "application/json" {
+		t.Fatalf("Unexpected spec content type: %s", specs[0].ContentType)
+	}
+
+	supplementaries, err := pkg.SupplementariesFor(specs[0])
+	if err != nil || len(supplementaries) != 1 {
+		t.Fatalf("Expected one supplementary, got %d: %v", len(supplementaries), err)
+	}
+	storedSupplementary, err := supplementaries[0].ReadAllBytes()
+	if err != nil || !bytes.Equal(storedSupplementary, supplementaryContent) {
+		t.Fatalf("Supplementary content mismatch: %v", err)
+	}
+	if supplementaries[0].ContentType != "application/pdf" {
+		t.Fatalf("Conflicting extension content type was not preserved: %s",
+			supplementaries[0].ContentType)
+	}
+
+	storedThumbnail, err := pkg.Thumbnail()
+	if err != nil || storedThumbnail == nil {
+		t.Fatalf("Expected thumbnail: %v", err)
+	}
+	content, err := storedThumbnail.ReadAllBytes()
+	if err != nil || !bytes.Equal(content, thumbnailContent) {
+		t.Fatalf("Thumbnail content mismatch: %v", err)
+	}
+}
+
+func TestPackageWriterCopiesIncrementallyWithFixedBuffer(t *testing.T) {
+	var destination bytes.Buffer
+	writer, err := NewPackaging().CreateWriter(&destination)
+	if err != nil {
+		t.Fatalf("Failed to create streaming writer: %v", err)
+	}
+	sizeAfterCreate := destination.Len()
+	payload := incompressibleTestContent(512 * 1024)
+	source := &observingReader{reader: bytes.NewReader(payload)}
+	part, err := writer.PutPartFromStream(
+		mustParseURL("/large.bin"), "application/octet-stream", source)
+	if err != nil {
+		t.Fatalf("Failed to stream part: %v", err)
+	}
+	if source.maxReadSize > streamCopyBufferSize {
+		t.Fatalf("Source read buffer was %d bytes, maximum is %d",
+			source.maxReadSize, streamCopyBufferSize)
+	}
+	if destination.Len() <= sizeAfterCreate {
+		t.Fatal("Destination did not receive incremental part output before Close")
+	}
+	if err := writer.MakeSpec(part); err != nil {
+		t.Fatalf("Failed to make large part a spec: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close streaming writer: %v", err)
+	}
+}
+
+func TestPackageWriterRejectsDuplicateReservedAndForeignParts(t *testing.T) {
+	packaging := NewPackaging()
+	var firstOutput bytes.Buffer
+	first, err := packaging.CreateWriter(&firstOutput)
+	if err != nil {
+		t.Fatalf("Failed to create first writer: %v", err)
+	}
+	part, err := first.PutPartFromStream(
+		mustParseURL("/Data/File.bin"), "application/octet-stream", bytes.NewReader(nil))
+	if err != nil {
+		t.Fatalf("Failed to write first part: %v", err)
+	}
+	if _, err := first.PutPartFromStream(
+		mustParseURL("/data/file.bin"), "application/octet-stream", bytes.NewReader(nil),
+	); err == nil {
+		t.Fatal("Expected case-normalized duplicate part to be rejected")
+	}
+	for _, reserved := range []string{"/[Content_Types].xml", "/_rels/.rels"} {
+		if _, err := first.PutPartFromStream(
+			mustParseURL(reserved), "application/xml", bytes.NewReader(nil),
+		); err == nil {
+			t.Errorf("Expected reserved URI %s to be rejected", reserved)
+		}
+	}
+
+	var secondOutput bytes.Buffer
+	second, err := packaging.CreateWriter(&secondOutput)
+	if err != nil {
+		t.Fatalf("Failed to create second writer: %v", err)
+	}
+	if err := second.MakeSpec(part); err == nil {
+		t.Fatal("Expected foreign part handle to be rejected")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("Failed to close second writer: %v", err)
+	}
+	if err := first.MakeSpec(part); err != nil {
+		t.Fatalf("Validation errors should not poison writer: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Failed to close first writer: %v", err)
+	}
+}
+
+func TestPackageWriterPropagatesAndRetainsFailures(t *testing.T) {
+	sourceErr := errors.New("source failed")
+	var destination bytes.Buffer
+	writer, err := NewPackaging().CreateWriter(&destination)
+	if err != nil {
+		t.Fatalf("Failed to create streaming writer: %v", err)
+	}
+	_, err = writer.PutPartFromStream(
+		mustParseURL("/broken.bin"),
+		"application/octet-stream",
+		&errorAfterReader{content: []byte("partial"), err: sourceErr},
+	)
+	if !errors.Is(err, sourceErr) {
+		t.Fatalf("Expected source failure, got %v", err)
+	}
+	if _, err := writer.PutPartFromStream(
+		mustParseURL("/later.bin"), "application/octet-stream", bytes.NewReader(nil),
+	); !errors.Is(err, sourceErr) {
+		t.Fatalf("Expected retained source failure, got %v", err)
+	}
+	if err := writer.Close(); !errors.Is(err, sourceErr) {
+		t.Fatalf("Close did not return retained source failure: %v", err)
+	}
+	if err := writer.Close(); !errors.Is(err, sourceErr) {
+		t.Fatalf("Repeated Close did not return retained failure: %v", err)
+	}
+
+	destinationErr := errors.New("destination failed")
+	failingDestination := &switchFailWriter{err: destinationErr}
+	writer, err = NewPackaging().CreateWriter(failingDestination)
+	if err != nil {
+		t.Fatalf("Failed to create writer before enabling destination failure: %v", err)
+	}
+	failingDestination.fail = true
+	_, putErr := writer.PutPartFromStream(
+		mustParseURL("/large.bin"),
+		"application/octet-stream",
+		bytes.NewReader(incompressibleTestContent(128*1024)),
+	)
+	if putErr == nil {
+		putErr = writer.Close()
+	} else {
+		_ = writer.Close()
+	}
+	if !errors.Is(putErr, destinationErr) {
+		t.Fatalf("Expected destination failure, got %v", putErr)
 	}
 }
 

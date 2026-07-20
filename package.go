@@ -1091,6 +1091,314 @@ func (p *PackageRead) Thumbnail() (*Part, error) {
 
 // endregion
 
+// region PackageWriter
+
+// PackageWriter writes a new AAS package incrementally. It is append-only and
+// retains only part and relationship metadata in memory.
+type PackageWriter struct {
+	archiveWriter *zip.Writer
+	base          *packageBase
+	failure       error
+	closed        bool
+	closeErr      error
+	mu            sync.Mutex
+}
+
+// CreateWriter creates a bounded-memory, append-only package writer.
+// The caller retains ownership of writer.
+func (p *Packaging) CreateWriter(writer io.Writer) (*PackageWriter, error) {
+	if writer == nil {
+		return nil, errors.New("writer must not be nil")
+	}
+
+	result := &PackageWriter{
+		archiveWriter: zip.NewWriter(writer),
+		base:          newPackageBase("", nil),
+	}
+
+	originURI, _ := url.Parse("/aasx/aasx-origin")
+	origin, err := result.putPartFromStreamLocked(
+		originURI,
+		"text/plain",
+		strings.NewReader("Intentionally empty."),
+	)
+	if err != nil {
+		closeErr := result.archiveWriter.Close()
+		return nil, combineErrors(err, closeErr)
+	}
+	result.base.originURI = normalizeURI(origin.URI)
+	result.base.addRelationship("", origin.URI.String(), RelationTypeAasxOrigin)
+	return result, nil
+}
+
+// PutPartFromStream writes one complete part before returning. A failed input
+// or output poisons the writer because an append-only ZIP can not roll back it.
+func (writer *PackageWriter) PutPartFromStream(
+	uri *url.URL,
+	contentType string,
+	stream io.Reader,
+) (*Part, error) {
+	if writer == nil {
+		return nil, ErrWriterClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if err := writer.stateErrorLocked(); err != nil {
+		return nil, err
+	}
+	if stream == nil {
+		return nil, errors.New("part stream must not be nil")
+	}
+	return writer.putPartFromStreamLocked(uri, contentType, stream)
+}
+
+func (writer *PackageWriter) putPartFromStreamLocked(
+	uri *url.URL,
+	contentType string,
+	stream io.Reader,
+) (*Part, error) {
+	partURI, normalizedURI, zipPath, err := writer.validateNewPartLocked(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	entry, err := writer.archiveWriter.Create(zipPath)
+	if err != nil {
+		return nil, writer.failLocked(fmt.Errorf("failed to create part %s: %w", zipPath, err))
+	}
+	buffer := make([]byte, streamCopyBufferSize)
+	if _, err := io.CopyBuffer(entry, struct{ io.Reader }{stream}, buffer); err != nil {
+		return nil, writer.failLocked(fmt.Errorf("failed to copy part %s: %w", zipPath, err))
+	}
+
+	part := &Part{
+		URI:         partURI,
+		ContentType: contentType,
+		writeOnly:   true,
+	}
+	writer.base.parts[normalizedURI] = part
+	return part, nil
+}
+
+func (writer *PackageWriter) validateNewPartLocked(
+	uri *url.URL,
+) (*url.URL, string, string, error) {
+	if uri == nil || uri.Path == "" {
+		return nil, "", "", errors.New("part URI must not be empty")
+	}
+	if uri.Scheme != "" || uri.Host != "" || uri.RawQuery != "" || uri.Fragment != "" {
+		return nil, "", "", fmt.Errorf("part URI must be an internal path: %s", uri.String())
+	}
+
+	partPath := normalizePathForURI(uri.Path)
+	zipPath := strings.TrimPrefix(partPath, "/")
+	if partPath == "/" || strings.HasSuffix(uri.Path, "/") {
+		return nil, "", "", fmt.Errorf("part URI must identify a file: %s", uri.String())
+	}
+	if isOPCMetadataPath(zipPath) {
+		return nil, "", "", fmt.Errorf("part URI is reserved for OPC metadata: %s", partPath)
+	}
+
+	partURI, err := url.Parse(partPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("invalid part URI %s: %w", partPath, err)
+	}
+	normalizedURI := normalizeURI(partURI)
+	if _, exists := writer.base.parts[normalizedURI]; exists {
+		return nil, "", "", fmt.Errorf("part already exists: %s", partPath)
+	}
+	return partURI, normalizedURI, zipPath, nil
+}
+
+// MakeSpec relates part to the AASX origin as a specification part.
+func (writer *PackageWriter) MakeSpec(part *Part) error {
+	if writer == nil {
+		return ErrWriterClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if err := writer.stateErrorLocked(); err != nil {
+		return err
+	}
+	stored, err := writer.validatePartLocked(part)
+	if err != nil {
+		return err
+	}
+	if !writer.base.hasRelationship(
+		writer.base.originURI, stored.URI.String(), RelationTypeAasxSpec) {
+		writer.base.addRelationship(
+			writer.base.originURI, stored.URI.String(), RelationTypeAasxSpec)
+	}
+	return nil
+}
+
+// RelateSupplementaryToSpec creates a supplementary relationship. Its argument
+// order matches PackageReadWrite: supplementary first, specification second.
+func (writer *PackageWriter) RelateSupplementaryToSpec(
+	supplementary *Part,
+	spec *Part,
+) error {
+	if writer == nil {
+		return ErrWriterClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if err := writer.stateErrorLocked(); err != nil {
+		return err
+	}
+	storedSupplementary, err := writer.validatePartLocked(supplementary)
+	if err != nil {
+		return err
+	}
+	storedSpec, err := writer.validatePartLocked(spec)
+	if err != nil {
+		return err
+	}
+	if !writer.base.hasRelationship(
+		writer.base.originURI, storedSpec.URI.String(), RelationTypeAasxSpec) {
+		return fmt.Errorf("part is not a specification: %s", storedSpec.URI.String())
+	}
+	if !writer.base.hasRelationship(
+		storedSpec.URI.String(),
+		storedSupplementary.URI.String(),
+		RelationTypeAasxSupplementary,
+	) {
+		writer.base.addRelationship(
+			storedSpec.URI.String(),
+			storedSupplementary.URI.String(),
+			RelationTypeAasxSupplementary,
+		)
+	}
+	return nil
+}
+
+// SetThumbnail sets part as the package thumbnail.
+func (writer *PackageWriter) SetThumbnail(part *Part) error {
+	if writer == nil {
+		return ErrWriterClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if err := writer.stateErrorLocked(); err != nil {
+		return err
+	}
+	stored, err := writer.validatePartLocked(part)
+	if err != nil {
+		return err
+	}
+	for _, rel := range writer.base.getRelationshipsByType("", RelationTypeThumbnail) {
+		writer.base.removeRelationship("", rel.target, RelationTypeThumbnail)
+	}
+	writer.base.addRelationship("", stored.URI.String(), RelationTypeThumbnail)
+	return nil
+}
+
+func (writer *PackageWriter) validatePartLocked(part *Part) (*Part, error) {
+	if part == nil || !part.writeOnly || part.URI == nil {
+		return nil, errors.New("part does not belong to this package writer")
+	}
+	stored, exists := writer.base.parts[normalizeURI(part.URI)]
+	if !exists || stored != part {
+		return nil, errors.New("part does not belong to this package writer")
+	}
+	return stored, nil
+}
+
+func (writer *PackageWriter) stateErrorLocked() error {
+	if writer.closed {
+		return ErrWriterClosed
+	}
+	return writer.failure
+}
+
+func (writer *PackageWriter) failLocked(err error) error {
+	if writer.failure == nil {
+		writer.failure = err
+	}
+	return writer.failure
+}
+
+// Close writes OPC metadata and finalizes the ZIP exactly once. It does not
+// close the caller-owned destination.
+func (writer *PackageWriter) Close() error {
+	if writer == nil {
+		return ErrWriterClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if writer.closed {
+		return writer.closeErr
+	}
+	writer.closed = true
+
+	result := writer.failure
+	if result == nil {
+		result = writer.writeMetadataLocked()
+	}
+	result = combineErrors(result, writer.archiveWriter.Close())
+	writer.closeErr = result
+	return result
+}
+
+func (writer *PackageWriter) writeMetadataLocked() error {
+	contentTypes := buildContentTypes(writer.base.parts)
+	if err := writer.writeXMLEntryLocked("[Content_Types].xml", contentTypes); err != nil {
+		return fmt.Errorf("failed to write content types: %w", err)
+	}
+
+	sourcePaths := make([]string, 0, len(writer.base.relationships))
+	for sourcePath, relationships := range writer.base.relationships {
+		if len(relationships) != 0 {
+			sourcePaths = append(sourcePaths, sourcePath)
+		}
+	}
+	sort.Strings(sourcePaths)
+	for _, sourcePath := range sourcePaths {
+		rels := relationshipsXML{Xmlns: opcRelationshipNamespace}
+		for _, rel := range writer.base.relationships[sourcePath] {
+			rels.Relationships = append(rels.Relationships, relationshipXML{
+				ID:         rel.id,
+				Type:       rel.relType,
+				Target:     rel.target,
+				TargetMode: rel.targetMode,
+			})
+		}
+		entryPath := strings.TrimPrefix(getRelsPath(sourcePath), "/")
+		if err := writer.writeXMLEntryLocked(entryPath, rels); err != nil {
+			return fmt.Errorf("failed to write relationships %s: %w", entryPath, err)
+		}
+	}
+	return nil
+}
+
+func (writer *PackageWriter) writeXMLEntryLocked(name string, value interface{}) error {
+	entry, err := writer.archiveWriter.Create(name)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(entry, xml.Header); err != nil {
+		return err
+	}
+	encoder := xml.NewEncoder(entry)
+	encoder.Indent("", "  ")
+	if err := encoder.Encode(value); err != nil {
+		return err
+	}
+	return encoder.Flush()
+}
+
+func combineErrors(primary error, additional error) error {
+	if primary == nil {
+		return additional
+	}
+	if additional == nil {
+		return primary
+	}
+	return fmt.Errorf("%w; additionally: %v", primary, additional)
+}
+
+// endregion
+
 // region PackageReadWrite
 
 // PackageReadWrite provides read and write access to an AAS package.
@@ -1486,6 +1794,10 @@ func (p *PackageReadWrite) writeToZip(w io.Writer) error {
 
 // buildContentTypes builds the content types XML structure
 func (p *PackageReadWrite) buildContentTypes() contentTypesXML {
+	return buildContentTypes(p.base.parts)
+}
+
+func buildContentTypes(parts map[string]*Part) contentTypesXML {
 	ct := contentTypesXML{
 		Xmlns: opcContentTypesNamespace,
 	}
@@ -1500,7 +1812,7 @@ func (p *PackageReadWrite) buildContentTypes() contentTypesXML {
 	extMap := make(map[string]string)
 	overrides := make(map[string]string)
 
-	for _, part := range p.base.parts {
+	for _, part := range parts {
 		partPath := part.URI.String()
 		ext := strings.TrimPrefix(filepath.Ext(partPath), ".")
 		ext = strings.ToLower(ext)
