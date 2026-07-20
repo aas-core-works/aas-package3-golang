@@ -1922,6 +1922,14 @@ func buildContentTypes(parts map[string]*Part) contentTypesXML {
 }
 
 func buildContentTypesForParts(parts []contentTypePart) contentTypesXML {
+	parts = append([]contentTypePart(nil), parts...)
+	sort.Slice(parts, func(i, j int) bool {
+		if parts[i].path == parts[j].path {
+			return parts[i].contentType < parts[j].contentType
+		}
+		return parts[i].path < parts[j].path
+	})
+
 	ct := contentTypesXML{
 		Xmlns: opcContentTypesNamespace,
 	}

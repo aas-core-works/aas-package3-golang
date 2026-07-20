@@ -101,6 +101,18 @@ type errorAfterReader struct {
 	err     error
 }
 
+type failingReadSeeker struct {
+	err error
+}
+
+func (reader *failingReadSeeker) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
+func (reader *failingReadSeeker) Seek(int64, int) (int64, error) {
+	return 0, reader.err
+}
+
 func (reader *errorAfterReader) Read(buffer []byte) (int, error) {
 	if len(reader.content) == 0 {
 		return 0, reader.err
@@ -744,6 +756,50 @@ func TestLazyReaderUsesFixedReadChunksAndDeclaredSizeGuard(t *testing.T) {
 	}
 	if len(content) > 1 {
 		t.Fatalf("Read %d bytes beyond declared expanded size", len(content))
+	}
+}
+
+func TestBoundedReaderCapsChunksAndReportsLimits(t *testing.T) {
+	source := &observingReader{reader: bytes.NewReader(bytes.Repeat([]byte{0x42}, 64*1024))}
+	stream := &boundedReadCloser{
+		stream:    io.NopCloser(source),
+		remaining: 32,
+		label:     "test stream exceeds limit",
+	}
+	if read, err := stream.Read(nil); read != 0 || err != nil {
+		t.Fatalf("Zero-length read returned %d, %v", read, err)
+	}
+	content, err := io.ReadAll(stream)
+	if !errors.Is(err, ErrReaderLimitExceeded) {
+		t.Fatalf("Expected reader limit error, got %v", err)
+	}
+	if len(content) != 32 {
+		t.Fatalf("Expected 32 bytes before limit error, got %d", len(content))
+	}
+	if source.maxReadSize > streamCopyBufferSize {
+		t.Fatalf("Bounded reader requested %d bytes, maximum is %d",
+			source.maxReadSize, streamCopyBufferSize)
+	}
+}
+
+func TestLazyReaderRejectsInvalidReaderArguments(t *testing.T) {
+	packaging := NewPackaging()
+	if _, err := packaging.OpenReadFromReaderAt(nil, 0); err == nil {
+		t.Fatal("Expected nil ReaderAt to be rejected")
+	}
+	if _, err := packaging.OpenReadFromReaderAt(bytes.NewReader(nil), -1); err == nil {
+		t.Fatal("Expected negative ReaderAt size to be rejected")
+	}
+	if _, err := packaging.OpenReadFromStream(nil); err == nil {
+		t.Fatal("Expected nil ReadSeeker to be rejected")
+	}
+	seekErr := errors.New("seek failed")
+	if _, err := packaging.OpenReadFromStream(&failingReadSeeker{err: seekErr}); !errors.Is(err, seekErr) {
+		t.Fatalf("Expected ReadSeeker seek error, got %v", err)
+	}
+	adapter := &readSeekerAt{stream: bytes.NewReader(nil)}
+	if _, err := adapter.ReadAt(make([]byte, 1), -1); err == nil {
+		t.Fatal("Expected negative ReadAt offset to be rejected")
 	}
 }
 
@@ -2494,6 +2550,118 @@ func TestPackageWriterSnapshotsMutablePartHandles(t *testing.T) {
 		storedThumbnail.ContentType != "image/png" {
 		t.Fatalf("Thumbnail metadata followed mutable handle: %s, %s",
 			storedThumbnail.URI.String(), storedThumbnail.ContentType)
+	}
+}
+
+func TestBuildContentTypesIsDeterministicForConflictingExtensions(t *testing.T) {
+	first := buildContentTypesForParts([]contentTypePart{
+		{path: "/z/data.json", contentType: "application/x-z"},
+		{path: "/a/data.json", contentType: "application/x-a"},
+		{path: "/without-extension", contentType: "application/octet-stream"},
+	})
+	second := buildContentTypesForParts([]contentTypePart{
+		{path: "/without-extension", contentType: "application/octet-stream"},
+		{path: "/a/data.json", contentType: "application/x-a"},
+		{path: "/z/data.json", contentType: "application/x-z"},
+	})
+	firstXML, err := xml.Marshal(first)
+	if err != nil {
+		t.Fatalf("Failed to marshal first content types: %v", err)
+	}
+	secondXML, err := xml.Marshal(second)
+	if err != nil {
+		t.Fatalf("Failed to marshal second content types: %v", err)
+	}
+	if !bytes.Equal(firstXML, secondXML) {
+		t.Fatalf("Content types depend on part insertion order:\n%s\n%s", firstXML, secondXML)
+	}
+
+	var jsonDefault string
+	for _, defaultContentType := range first.Defaults {
+		if defaultContentType.Extension == "json" {
+			jsonDefault = defaultContentType.ContentType
+		}
+	}
+	if jsonDefault != "application/x-a" {
+		t.Fatalf("Expected lexically first JSON part to define default, got %s", jsonDefault)
+	}
+}
+
+func TestPackageWriterValidatesInputsAndClosedState(t *testing.T) {
+	packaging := NewPackaging()
+	if _, err := packaging.CreateWriter(nil); err == nil {
+		t.Fatal("Expected nil destination to be rejected")
+	}
+
+	var nilWriter *PackageWriter
+	if _, err := nilWriter.PutPartFromStream(nil, "", nil); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected nil writer Put error, got %v", err)
+	}
+	if err := nilWriter.MakeSpec(nil); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected nil writer MakeSpec error, got %v", err)
+	}
+	if err := nilWriter.RelateSupplementaryToSpec(nil, nil); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected nil writer relationship error, got %v", err)
+	}
+	if err := nilWriter.SetThumbnail(nil); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected nil writer thumbnail error, got %v", err)
+	}
+	if err := nilWriter.Close(); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected nil writer Close error, got %v", err)
+	}
+
+	var destination bytes.Buffer
+	writer, err := packaging.CreateWriter(&destination)
+	if err != nil {
+		t.Fatalf("Failed to create writer: %v", err)
+	}
+	if _, err := writer.PutPartFromStream(
+		mustParseURL("/nil-stream.bin"), "application/octet-stream", nil,
+	); err == nil {
+		t.Fatal("Expected nil part stream to be rejected")
+	}
+	invalidURIs := []*url.URL{
+		nil,
+		{},
+		mustParseURL("https://example.com/external.bin"),
+		mustParseURL("/"),
+		mustParseURL("/directory/"),
+		mustParseURL("/query.bin?value=1"),
+		mustParseURL("/fragment.bin#value"),
+	}
+	for index, uri := range invalidURIs {
+		if _, err := writer.PutPartFromStream(
+			uri, "application/octet-stream", bytes.NewReader(nil),
+		); err == nil {
+			t.Errorf("Invalid URI %d was accepted", index)
+		}
+	}
+	if err := writer.MakeSpec(nil); err == nil {
+		t.Fatal("Expected nil part handle to be rejected")
+	}
+	part, err := writer.PutPartFromStream(
+		mustParseURL("/part.bin"), "application/octet-stream", bytes.NewReader(nil))
+	if err != nil {
+		t.Fatalf("Failed to write valid part: %v", err)
+	}
+	if err := writer.RelateSupplementaryToSpec(part, part); err == nil {
+		t.Fatal("Expected relationship to an unmarked spec to be rejected")
+	}
+	if err := writer.SetThumbnail(nil); err == nil {
+		t.Fatal("Expected nil thumbnail handle to be rejected")
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Validation errors poisoned writer: %v", err)
+	}
+	closedOperations := []func() error{
+		func() error { return writer.MakeSpec(part) },
+		func() error { return writer.RelateSupplementaryToSpec(part, part) },
+		func() error { return writer.SetThumbnail(part) },
+	}
+	for index, operation := range closedOperations {
+		if err := operation(); !errors.Is(err, ErrWriterClosed) {
+			t.Errorf("Closed writer operation %d returned %v", index, err)
+		}
 	}
 }
 
