@@ -1151,10 +1151,18 @@ func (p *PackageRead) Thumbnail() (*Part, error) {
 type PackageWriter struct {
 	archiveWriter *zip.Writer
 	base          *packageBase
+	parts         map[string]*writerPartMetadata
+	handles       map[*Part]*writerPartMetadata
 	failure       error
 	closed        bool
 	closeErr      error
 	mu            sync.Mutex
+}
+
+type writerPartMetadata struct {
+	uri           string
+	normalizedURI string
+	contentType   string
 }
 
 // CreateWriter creates a bounded-memory, append-only package writer.
@@ -1167,6 +1175,8 @@ func (p *Packaging) CreateWriter(writer io.Writer) (*PackageWriter, error) {
 	result := &PackageWriter{
 		archiveWriter: zip.NewWriter(writer),
 		base:          newPackageBase("", nil),
+		parts:         make(map[string]*writerPartMetadata),
+		handles:       make(map[*Part]*writerPartMetadata),
 	}
 
 	originURI, _ := url.Parse("/aasx/aasx-origin")
@@ -1179,8 +1189,10 @@ func (p *Packaging) CreateWriter(writer io.Writer) (*PackageWriter, error) {
 		closeErr := result.archiveWriter.Close()
 		return nil, combineErrors(err, closeErr)
 	}
-	result.base.originURI = normalizeURI(origin.URI)
-	result.base.addRelationship("", origin.URI.String(), RelationTypeAasxOrigin)
+	originMetadata, err := result.validatePartLocked(origin)
+	Ensure(err == nil, "The origin handle must belong to the package writer.")
+	result.base.originURI = originMetadata.normalizedURI
+	result.base.addRelationship("", originMetadata.uri, RelationTypeAasxOrigin)
 	return result, nil
 }
 
@@ -1229,7 +1241,13 @@ func (writer *PackageWriter) putPartFromStreamLocked(
 		ContentType: contentType,
 		writeOnly:   true,
 	}
-	writer.base.parts[normalizedURI] = part
+	metadata := &writerPartMetadata{
+		uri:           partURI.String(),
+		normalizedURI: normalizedURI,
+		contentType:   contentType,
+	}
+	writer.parts[normalizedURI] = metadata
+	writer.handles[part] = metadata
 	return part, nil
 }
 
@@ -1248,7 +1266,7 @@ func (writer *PackageWriter) validateNewPartLocked(
 	if partPath == "/" || strings.HasSuffix(uri.Path, "/") {
 		return nil, "", "", fmt.Errorf("part URI must identify a file: %s", uri.String())
 	}
-	if isOPCMetadataPath(zipPath) {
+	if isReservedOPCPath(zipPath) {
 		return nil, "", "", fmt.Errorf("part URI is reserved for OPC metadata: %s", partPath)
 	}
 
@@ -1257,7 +1275,7 @@ func (writer *PackageWriter) validateNewPartLocked(
 		return nil, "", "", fmt.Errorf("invalid part URI %s: %w", partPath, err)
 	}
 	normalizedURI := normalizeURI(partURI)
-	if _, exists := writer.base.parts[normalizedURI]; exists {
+	if _, exists := writer.parts[normalizedURI]; exists {
 		return nil, "", "", fmt.Errorf("part already exists: %s", partPath)
 	}
 	return partURI, normalizedURI, zipPath, nil
@@ -1278,9 +1296,9 @@ func (writer *PackageWriter) MakeSpec(part *Part) error {
 		return err
 	}
 	if !writer.base.hasRelationship(
-		writer.base.originURI, stored.URI.String(), RelationTypeAasxSpec) {
+		writer.base.originURI, stored.uri, RelationTypeAasxSpec) {
 		writer.base.addRelationship(
-			writer.base.originURI, stored.URI.String(), RelationTypeAasxSpec)
+			writer.base.originURI, stored.uri, RelationTypeAasxSpec)
 	}
 	return nil
 }
@@ -1308,17 +1326,17 @@ func (writer *PackageWriter) RelateSupplementaryToSpec(
 		return err
 	}
 	if !writer.base.hasRelationship(
-		writer.base.originURI, storedSpec.URI.String(), RelationTypeAasxSpec) {
-		return fmt.Errorf("part is not a specification: %s", storedSpec.URI.String())
+		writer.base.originURI, storedSpec.uri, RelationTypeAasxSpec) {
+		return fmt.Errorf("part is not a specification: %s", storedSpec.uri)
 	}
 	if !writer.base.hasRelationship(
-		storedSpec.URI.String(),
-		storedSupplementary.URI.String(),
+		storedSpec.uri,
+		storedSupplementary.uri,
 		RelationTypeAasxSupplementary,
 	) {
 		writer.base.addRelationship(
-			storedSpec.URI.String(),
-			storedSupplementary.URI.String(),
+			storedSpec.uri,
+			storedSupplementary.uri,
 			RelationTypeAasxSupplementary,
 		)
 	}
@@ -1342,16 +1360,16 @@ func (writer *PackageWriter) SetThumbnail(part *Part) error {
 	for _, rel := range writer.base.getRelationshipsByType("", RelationTypeThumbnail) {
 		writer.base.removeRelationship("", rel.target, RelationTypeThumbnail)
 	}
-	writer.base.addRelationship("", stored.URI.String(), RelationTypeThumbnail)
+	writer.base.addRelationship("", stored.uri, RelationTypeThumbnail)
 	return nil
 }
 
-func (writer *PackageWriter) validatePartLocked(part *Part) (*Part, error) {
-	if part == nil || !part.writeOnly || part.URI == nil {
+func (writer *PackageWriter) validatePartLocked(part *Part) (*writerPartMetadata, error) {
+	if part == nil || !part.writeOnly {
 		return nil, errors.New("part does not belong to this package writer")
 	}
-	stored, exists := writer.base.parts[normalizeURI(part.URI)]
-	if !exists || stored != part {
+	stored, exists := writer.handles[part]
+	if !exists {
 		return nil, errors.New("part does not belong to this package writer")
 	}
 	return stored, nil
@@ -1394,7 +1412,11 @@ func (writer *PackageWriter) Close() error {
 }
 
 func (writer *PackageWriter) writeMetadataLocked() error {
-	contentTypes := buildContentTypes(writer.base.parts)
+	parts := make([]contentTypePart, 0, len(writer.parts))
+	for _, part := range writer.parts {
+		parts = append(parts, contentTypePart{path: part.uri, contentType: part.contentType})
+	}
+	contentTypes := buildContentTypesForParts(parts)
 	if err := writer.writeXMLEntryLocked("[Content_Types].xml", contentTypes); err != nil {
 		return fmt.Errorf("failed to write content types: %w", err)
 	}
@@ -1883,7 +1905,23 @@ func (p *PackageReadWrite) buildContentTypes() contentTypesXML {
 	return buildContentTypes(p.base.parts)
 }
 
+type contentTypePart struct {
+	path        string
+	contentType string
+}
+
 func buildContentTypes(parts map[string]*Part) contentTypesXML {
+	contentTypeParts := make([]contentTypePart, 0, len(parts))
+	for _, part := range parts {
+		contentTypeParts = append(contentTypeParts, contentTypePart{
+			path:        part.URI.String(),
+			contentType: part.ContentType,
+		})
+	}
+	return buildContentTypesForParts(contentTypeParts)
+}
+
+func buildContentTypesForParts(parts []contentTypePart) contentTypesXML {
 	ct := contentTypesXML{
 		Xmlns: opcContentTypesNamespace,
 	}
@@ -1899,21 +1937,21 @@ func buildContentTypes(parts map[string]*Part) contentTypesXML {
 	overrides := make(map[string]string)
 
 	for _, part := range parts {
-		partPath := part.URI.String()
+		partPath := part.path
 		ext := strings.TrimPrefix(filepath.Ext(partPath), ".")
 		ext = strings.ToLower(ext)
 
 		if ext == "" {
 			// No extension, need override
-			overrides[partPath] = part.ContentType
+			overrides[partPath] = part.contentType
 		} else {
 			if existingCT, ok := extMap[ext]; ok {
 				// Extension already seen with different content type - need override
-				if existingCT != part.ContentType {
-					overrides[partPath] = part.ContentType
+				if existingCT != part.contentType {
+					overrides[partPath] = part.contentType
 				}
 			} else {
-				extMap[ext] = part.ContentType
+				extMap[ext] = part.contentType
 			}
 		}
 	}

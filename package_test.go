@@ -2361,12 +2361,25 @@ func TestPackageWriterRejectsDuplicateReservedAndForeignParts(t *testing.T) {
 	); err == nil {
 		t.Fatal("Expected case-normalized duplicate part to be rejected")
 	}
-	for _, reserved := range []string{"/[Content_Types].xml", "/_rels/.rels"} {
+	for _, reserved := range []string{
+		"/[Content_Types].xml",
+		"/_rels/.rels",
+		"/_rels/data.bin",
+		"/folder/_rels/data.bin",
+	} {
 		if _, err := first.PutPartFromStream(
 			mustParseURL(reserved), "application/xml", bytes.NewReader(nil),
 		); err == nil {
 			t.Errorf("Expected reserved URI %s to be rejected", reserved)
 		}
+	}
+	nearMatch, err := first.PutPartFromStream(
+		mustParseURL("/foo_rels/data.bin"),
+		"application/octet-stream",
+		bytes.NewReader([]byte("visible")),
+	)
+	if err != nil {
+		t.Fatalf("Near-match OPC path should be accepted: %v", err)
 	}
 
 	var secondOutput bytes.Buffer
@@ -2385,6 +2398,102 @@ func TestPackageWriterRejectsDuplicateReservedAndForeignParts(t *testing.T) {
 	}
 	if err := first.Close(); err != nil {
 		t.Fatalf("Failed to close first writer: %v", err)
+	}
+	opened, err := packaging.OpenReadFromReaderAt(
+		bytes.NewReader(firstOutput.Bytes()), int64(firstOutput.Len()))
+	if err != nil {
+		t.Fatalf("Failed to reopen first writer output: %v", err)
+	}
+	defer opened.Close()
+	storedNearMatch, err := opened.MustPart(nearMatch.URI)
+	if err != nil {
+		t.Fatalf("Near-match writer part was hidden by reader: %v", err)
+	}
+	content, err := storedNearMatch.ReadAllBytes()
+	if err != nil || string(content) != "visible" {
+		t.Fatalf("Unexpected near-match writer content %q: %v", content, err)
+	}
+}
+
+func TestPackageWriterSnapshotsMutablePartHandles(t *testing.T) {
+	var destination bytes.Buffer
+	writer, err := NewPackaging().CreateWriter(&destination)
+	if err != nil {
+		t.Fatalf("Failed to create writer: %v", err)
+	}
+
+	spec, err := writer.PutPartFromStream(
+		mustParseURL("/original/spec.json"), "application/json", strings.NewReader("spec"))
+	if err != nil {
+		t.Fatalf("Failed to write spec: %v", err)
+	}
+	spec.URI = nil
+	spec.ContentType = "application/x-mutated"
+	if err := writer.MakeSpec(spec); err != nil {
+		t.Fatalf("Mutated spec handle was not treated as an opaque handle: %v", err)
+	}
+
+	supplementaryURIs := []string{"/original/manual.pdf", "/original/schema.xml"}
+	for _, rawURI := range supplementaryURIs {
+		supplementary, putErr := writer.PutPartFromStream(
+			mustParseURL(rawURI), "application/octet-stream", strings.NewReader(rawURI))
+		if putErr != nil {
+			t.Fatalf("Failed to write supplementary %s: %v", rawURI, putErr)
+		}
+		supplementary.URI = mustParseURL("/mutated.bin")
+		supplementary.ContentType = "application/x-mutated"
+		if relateErr := writer.RelateSupplementaryToSpec(supplementary, spec); relateErr != nil {
+			t.Fatalf("Failed to relate mutated supplementary handle: %v", relateErr)
+		}
+	}
+
+	thumbnail, err := writer.PutPartFromStream(
+		mustParseURL("/original/thumbnail.png"), "image/png", strings.NewReader("thumbnail"))
+	if err != nil {
+		t.Fatalf("Failed to write thumbnail: %v", err)
+	}
+	thumbnail.URI = mustParseURL("/mutated.png")
+	thumbnail.ContentType = "application/x-mutated"
+	if err := writer.SetThumbnail(thumbnail); err != nil {
+		t.Fatalf("Failed to set mutated thumbnail handle: %v", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close writer: %v", err)
+	}
+	pkg, err := NewPackaging().OpenReadFromReaderAt(
+		bytes.NewReader(destination.Bytes()), int64(destination.Len()))
+	if err != nil {
+		t.Fatalf("Failed to open writer output: %v", err)
+	}
+	defer pkg.Close()
+
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one snapshotted spec, got %d: %v", len(specs), err)
+	}
+	if specs[0].URI.String() != "/original/spec.json" || specs[0].ContentType != "application/json" {
+		t.Fatalf("Spec metadata followed mutable handle: %s, %s",
+			specs[0].URI.String(), specs[0].ContentType)
+	}
+	supplementaries, err := pkg.SupplementariesFor(specs[0])
+	if err != nil || len(supplementaries) != len(supplementaryURIs) {
+		t.Fatalf("Expected %d supplementaries, got %d: %v",
+			len(supplementaryURIs), len(supplementaries), err)
+	}
+	for _, rawURI := range supplementaryURIs {
+		if _, err := pkg.MustPart(mustParseURL(rawURI)); err != nil {
+			t.Errorf("Snapshotted supplementary %s not found: %v", rawURI, err)
+		}
+	}
+	storedThumbnail, err := pkg.Thumbnail()
+	if err != nil || storedThumbnail == nil {
+		t.Fatalf("Expected snapshotted thumbnail: %v", err)
+	}
+	if storedThumbnail.URI.String() != "/original/thumbnail.png" ||
+		storedThumbnail.ContentType != "image/png" {
+		t.Fatalf("Thumbnail metadata followed mutable handle: %s, %s",
+			storedThumbnail.URI.String(), storedThumbnail.ContentType)
 	}
 }
 
