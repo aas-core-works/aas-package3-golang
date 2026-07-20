@@ -3,7 +3,6 @@
 [![Test](https://github.com/aas-core-works/aas-package3-golang/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/aas-core-works/aas-package3-golang/actions/workflows/test.yml)
 [![Check style](https://github.com/aas-core-works/aas-package3-golang/actions/workflows/check-style.yml/badge.svg)](https://github.com/aas-core-works/aas-package3-golang/actions/workflows/check-style.yml)
 [![Coverage Status](https://coveralls.io/repos/github/aas-core-works/aas-package3-golang/badge.svg?branch=main)](https://coveralls.io/github/aas-core-works/aas-package3-golang?branch=main)
-[![Go Report Card](https://goreportcard.com/badge/github.com/aas-core-works/aas-package3-golang)](https://goreportcard.com/report/github.com/aas-core-works/aas-package3-golang)
 [![Go Reference](https://pkg.go.dev/badge/github.com/aas-core-works/aas-package3-golang.svg)](https://pkg.go.dev/github.com/aas-core-works/aas-package3-golang)
 
 Aas-package3-golang is a library for reading and writing packaged file format of an [Asset Administration Shell (AAS)] in Go.
@@ -116,7 +115,7 @@ go get github.com/aas-core-works/aas-package3-golang
 ### Types
 
 | Type | Description |
-|------|-------------|
+| ------ | ------------- |
 | `Packaging` | Factory for opening and creating AASX packages |
 | `PackageRead` | Read-only access to an AASX package |
 | `PackageReadWrite` | Read and write access to an AASX package |
@@ -125,7 +124,7 @@ go get github.com/aas-core-works/aas-package3-golang
 ### Packaging Methods
 
 | Method | Description |
-|--------|-------------|
+| -------- | ------------- |
 | `Create(path)` | Create a new AASX package at the given path |
 | `CreateInStream(stream)` | Create a new AASX package in a stream |
 | `OpenRead(path)` | Open an AASX package for reading |
@@ -136,7 +135,7 @@ go get github.com/aas-core-works/aas-package3-golang
 ### PackageRead Methods
 
 | Method | Description |
-|--------|-------------|
+| -------- | ------------- |
 | `Specs()` | List all AAS spec parts |
 | `SpecsByContentType()` | List specs grouped by MIME type |
 | `IsSpec(part)` | Check if a part is a spec |
@@ -152,7 +151,7 @@ go get github.com/aas-core-works/aas-package3-golang
 Inherits all `PackageRead` methods, plus:
 
 | Method | Description |
-|--------|-------------|
+| -------- | ------------- |
 | `PutPart(uri, contentType, content)` | Write a part to the package |
 | `PutPartFromStream(uri, contentType, stream)` | Write a part from a stream |
 | `DeletePart(part)` | Remove a part from the package |
