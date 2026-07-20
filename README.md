@@ -3,8 +3,7 @@
 [![Test](https://github.com/aas-core-works/aas-package3-golang/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/aas-core-works/aas-package3-golang/actions/workflows/test.yml)
 [![Check style](https://github.com/aas-core-works/aas-package3-golang/actions/workflows/check-style.yml/badge.svg)](https://github.com/aas-core-works/aas-package3-golang/actions/workflows/check-style.yml)
 [![Coverage Status](https://coveralls.io/repos/github/aas-core-works/aas-package3-golang/badge.svg?branch=main)](https://coveralls.io/github/aas-core-works/aas-package3-golang?branch=main)
-[![Go Report Card](https://goreportcard.com/badge/github.com/aas-core-works/aas-package3-golang)](https://goreportcard.com/report/github.com/aas-core-works/aas-package3-golang)
-[![Go Reference](https://pkg.go.dev/badge/github.com/aas-core-works/aas-package3-golang.svg)](https://pkg.go.dev/github.com/aas-core-works/aas-package3-golang)
+[![Go Reference](https://pkg.go.dev/badge/github.com/aas-core-works/aas-package3-golang/v2.svg)](https://pkg.go.dev/github.com/aas-core-works/aas-package3-golang/v2)
 
 Aas-package3-golang is a library for reading and writing packaged file format of an [Asset Administration Shell (AAS)] in Go.
 
@@ -29,7 +28,7 @@ To create and write to a package:
 ```go
 import (
     "net/url"
-    aasx "github.com/aas-core-works/aas-package3-golang"
+    aasx "github.com/aas-core-works/aas-package3-golang/v2"
 )
 
 // General packaging handler to be shared across the program
@@ -56,7 +55,7 @@ pkg.SetThumbnail(thumb)
 
 supplURI, _ := url.Parse("/aasx-suppl/some-company/some-manual.pdf")
 suppl, _ := pkg.PutPart(supplURI, "application/pdf", supplementaryContent)
-pkg.RelateSupplementaryToSpec(spec, suppl)
+pkg.RelateSupplementaryToSpec(suppl, spec)
 
 pkg.Flush()
 ```
@@ -66,7 +65,7 @@ To read from the package:
 ```go
 import (
     "net/url"
-    aasx "github.com/aas-core-works/aas-package3-golang"
+    aasx "github.com/aas-core-works/aas-package3-golang/v2"
 )
 
 // General packaging handler to be shared across the program
@@ -108,7 +107,7 @@ Please see the full documentation at [doc/index.md](doc/index.md) for more detai
 ## Installation
 
 ```bash
-go get github.com/aas-core-works/aas-package3-golang
+go get github.com/aas-core-works/aas-package3-golang/v2
 ```
 
 ## API Overview
@@ -116,27 +115,30 @@ go get github.com/aas-core-works/aas-package3-golang
 ### Types
 
 | Type | Description |
-|------|-------------|
+| ------ | ------------- |
 | `Packaging` | Factory for opening and creating AASX packages |
 | `PackageRead` | Read-only access to an AASX package |
 | `PackageReadWrite` | Read and write access to an AASX package |
+| `PackageWriter` | Append-only, bounded-memory package creation |
 | `Part` | Represents a part within an AASX package |
 
 ### Packaging Methods
 
 | Method | Description |
-|--------|-------------|
+| -------- | ------------- |
 | `Create(path)` | Create a new AASX package at the given path |
 | `CreateInStream(stream)` | Create a new AASX package in a stream |
-| `OpenRead(path)` | Open an AASX package for reading |
-| `OpenReadFromStream(stream)` | Open an AASX package from a stream for reading |
+| `CreateWriter(writer)` | Create an append-only package directly on an `io.Writer` |
+| `OpenRead(path, options...)` | Lazily open an AASX package for reading |
+| `OpenReadFromStream(stream, options...)` | Lazily open from an `io.ReadSeeker` |
+| `OpenReadFromReaderAt(reader, size, options...)` | Lazily open from an `io.ReaderAt` |
 | `OpenReadWrite(path)` | Open an AASX package for read/write |
 | `OpenReadWriteFromStream(stream)` | Open an AASX package from a stream for read/write |
 
 ### PackageRead Methods
 
 | Method | Description |
-|--------|-------------|
+| -------- | ------------- |
 | `Specs()` | List all AAS spec parts |
 | `SpecsByContentType()` | List specs grouped by MIME type |
 | `IsSpec(part)` | Check if a part is a spec |
@@ -152,17 +154,34 @@ go get github.com/aas-core-works/aas-package3-golang
 Inherits all `PackageRead` methods, plus:
 
 | Method | Description |
-|--------|-------------|
+| -------- | ------------- |
 | `PutPart(uri, contentType, content)` | Write a part to the package |
 | `PutPartFromStream(uri, contentType, stream)` | Write a part from a stream |
 | `DeletePart(part)` | Remove a part from the package |
 | `MakeSpec(part)` | Mark a part as a spec |
 | `UnmakeSpec(part)` | Remove spec relationship |
-| `RelateSupplementaryToSpec(spec, supplementary)` | Create supplementary relationship |
-| `UnrelateSupplementaryFromSpec(spec, supplementary)` | Remove supplementary relationship |
+| `RelateSupplementaryToSpec(supplementary, spec)` | Create supplementary relationship |
+| `UnrelateSupplementaryFromSpec(supplementary, spec)` | Remove supplementary relationship |
 | `SetThumbnail(part)` | Set the package thumbnail |
 | `UnsetThumbnail()` | Remove the package thumbnail |
 | `Flush()` | Write pending changes |
+
+### Bounded-memory I/O
+
+Read-only packages keep ZIP payloads compressed until `Part.Stream`, `ReadAllBytes`, or
+`ReadAllText` is called. Keep the package open until all part streams are closed. CRC and
+decompression errors can therefore be reported while reading a part rather than by
+`OpenRead`.
+
+Use reader options such as `WithMaxPartCount`, `WithMaxOPCMetadataBytes`,
+`WithMaxPartExpandedBytes`, and `WithMaxTotalExpandedBytes` for untrusted packages.
+All limits default to zero, which means unlimited.
+
+For bounded-memory output, use `CreateWriter` and finish with `PackageWriter.Close`.
+The writer is append-only: every part is consumed before `PutPartFromStream` returns,
+and relationships plus content types are emitted during `Close`. The destination is
+caller-owned and may contain a partial ZIP if an operation fails. The mutable
+`PackageReadWrite` API remains available when overwrite and delete operations are needed.
 
 ## Versioning
 

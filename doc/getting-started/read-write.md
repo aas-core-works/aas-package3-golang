@@ -32,6 +32,43 @@ defer pkg.Close()
 
 Please do not forget to close the package when done, or use `defer`.
 
+## Creating a Package with Bounded Memory
+
+`Create` and `CreateInStream` provide mutable packages and retain part content until
+`Flush`. If you only need to create a package once, use the append-only `PackageWriter`
+to copy each part directly into the output ZIP:
+
+```go
+destination := ... // any io.Writer
+writer, err := packaging.CreateWriter(destination)
+if err != nil {
+    log.Fatal(err)
+}
+
+specURI, _ := url.Parse("/aasx/data.json")
+spec, err := writer.PutPartFromStream(specURI, "application/json", specReader)
+if err != nil {
+    log.Fatal(err)
+}
+if err := writer.MakeSpec(spec); err != nil {
+    log.Fatal(err)
+}
+
+if err := writer.Close(); err != nil {
+    log.Fatal(err)
+}
+```
+
+Each stream is completely consumed before `PutPartFromStream` returns. You can then call
+`MakeSpec`, `RelateSupplementaryToSpec(supplementary, spec)`, or `SetThumbnail` with the
+returned lightweight part handle. `Close` writes relationships and content types and
+finalizes the ZIP.
+
+The writer does not close `destination`. It does not support overwrite, delete, unrelate,
+or rollback; use `PackageReadWrite` when mutation is required. If an input, output, or
+`Close` operation fails, the destination can contain a partial package and should be
+discarded.
+
 ## Opening a Package for Read/Writing
 
 Opening a package for read/writing is similar to how we open a package for reading:
@@ -149,7 +186,7 @@ if err != nil {
     log.Fatal(err)
 }
 
-err = pkg.RelateSupplementaryToSpec(spec, supplementary)
+err = pkg.RelateSupplementaryToSpec(supplementary, spec)
 if err != nil {
     log.Fatal(err)
 }
@@ -158,7 +195,7 @@ if err != nil {
 The relation can also be undone:
 
 ```go
-err := pkg.UnrelateSupplementaryFromSpec(spec, supplementary)
+err := pkg.UnrelateSupplementaryFromSpec(supplementary, spec)
 if err != nil {
     log.Fatal(err)
 }

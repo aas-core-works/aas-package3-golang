@@ -3,11 +3,15 @@ package aasx
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/binary"
 	"encoding/xml"
+	"errors"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -35,6 +39,279 @@ func mustParseURL(rawURL string) *url.URL {
 		panic(err)
 	}
 	return u
+}
+
+type byteRange struct {
+	start int64
+	end   int64
+}
+
+type failingRangeReaderAt struct {
+	reader  *bytes.Reader
+	blocked byteRange
+	err     error
+}
+
+type observingRangeReaderAt struct {
+	reader      *bytes.Reader
+	observed    byteRange
+	maxReadSize int
+	mu          sync.Mutex
+}
+
+func (reader *observingRangeReaderAt) ReadAt(buffer []byte, offset int64) (int, error) {
+	end := offset + int64(len(buffer))
+	if offset < reader.observed.end && end > reader.observed.start {
+		reader.mu.Lock()
+		if len(buffer) > reader.maxReadSize {
+			reader.maxReadSize = len(buffer)
+		}
+		reader.mu.Unlock()
+	}
+	return reader.reader.ReadAt(buffer, offset)
+}
+
+func (reader *failingRangeReaderAt) ReadAt(buffer []byte, offset int64) (int, error) {
+	end := offset + int64(len(buffer))
+	if offset < reader.blocked.end && end > reader.blocked.start {
+		return 0, reader.err
+	}
+	return reader.reader.ReadAt(buffer, offset)
+}
+
+type closeTrackingReaderAt struct {
+	*bytes.Reader
+	closed bool
+}
+
+type observingReader struct {
+	reader      *bytes.Reader
+	maxReadSize int
+}
+
+func (reader *observingReader) Read(buffer []byte) (int, error) {
+	if len(buffer) > reader.maxReadSize {
+		reader.maxReadSize = len(buffer)
+	}
+	return reader.reader.Read(buffer)
+}
+
+type errorAfterReader struct {
+	content []byte
+	err     error
+}
+
+type failingReadSeeker struct {
+	err error
+}
+
+func (reader *failingReadSeeker) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
+func (reader *failingReadSeeker) Seek(int64, int) (int64, error) {
+	return 0, reader.err
+}
+
+func (reader *errorAfterReader) Read(buffer []byte) (int, error) {
+	if len(reader.content) == 0 {
+		return 0, reader.err
+	}
+	read := copy(buffer, reader.content)
+	reader.content = reader.content[read:]
+	return read, nil
+}
+
+type switchFailWriter struct {
+	bytes.Buffer
+	fail   bool
+	closed bool
+	err    error
+}
+
+type closeErrorReadCloser struct {
+	io.Reader
+	err error
+}
+
+func (stream *closeErrorReadCloser) Close() error {
+	return stream.err
+}
+
+type testZipFile struct {
+	content  []byte
+	closeErr error
+}
+
+func (file testZipFile) open() (io.ReadCloser, error) {
+	return &closeErrorReadCloser{Reader: bytes.NewReader(file.content), err: file.closeErr}, nil
+}
+
+func (file testZipFile) uncompressedSize() uint64 {
+	return uint64(len(file.content))
+}
+
+func (writer *switchFailWriter) Write(buffer []byte) (int, error) {
+	if writer.fail {
+		return 0, writer.err
+	}
+	return writer.Buffer.Write(buffer)
+}
+
+func (writer *switchFailWriter) Close() error {
+	writer.closed = true
+	return nil
+}
+
+func incompressibleTestContent(size int) []byte {
+	result := make([]byte, size)
+	state := uint32(0x12345678)
+	for index := range result {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		result[index] = byte(state)
+	}
+	return result
+}
+
+func (reader *closeTrackingReaderAt) Close() error {
+	reader.closed = true
+	return nil
+}
+
+func lazyTestPackage(t *testing.T) ([]byte, map[string]byteRange) {
+	t.Helper()
+
+	var output bytes.Buffer
+	writer := zip.NewWriter(&output)
+	ranges := make(map[string]byteRange)
+
+	writeEntry := func(name string, content []byte) {
+		t.Helper()
+		header := &zip.FileHeader{Name: name, Method: zip.Store}
+		entry, err := writer.CreateHeader(header)
+		if err != nil {
+			t.Fatalf("Failed to create %s: %v", name, err)
+		}
+		if _, err := entry.Write(content); err != nil {
+			t.Fatalf("Failed to write %s: %v", name, err)
+		}
+	}
+
+	writeEntry("aasx/aasx-origin", []byte("Intentionally empty."))
+	writeEntry("aasx/spec.bin", bytes.Repeat([]byte{0x11}, 128*1024))
+	writeEntry("aasx/other.bin", bytes.Repeat([]byte{0x22}, 128*1024))
+	// Keep the central-directory search window away from the parts asserted in
+	// the lazy-read tests.
+	writeEntry("aasx/padding.bin", bytes.Repeat([]byte{0x33}, 128*1024))
+	writeEntry("[Content_Types].xml", []byte(xml.Header+`<Types xmlns="`+
+		opcContentTypesNamespace+`"><Default Extension="bin" ContentType="application/octet-stream"/>`+
+		`<Override PartName="/aasx/aasx-origin" ContentType="text/plain"/></Types>`))
+	writeEntry("_rels/.rels", []byte(xml.Header+`<Relationships xmlns="`+
+		opcRelationshipNamespace+`"><Relationship Id="R1" Type="`+RelationTypeAasxOrigin+
+		`" Target="/aasx/aasx-origin"/></Relationships>`))
+	writeEntry("aasx/_rels/aasx-origin.rels", []byte(xml.Header+`<Relationships xmlns="`+
+		opcRelationshipNamespace+`"><Relationship Id="R2" Type="`+RelationTypeAasxSpec+
+		`" Target="/aasx/spec.bin"/></Relationships>`))
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close test ZIP: %v", err)
+	}
+	archive, err := zip.NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatalf("Failed to inspect test ZIP: %v", err)
+	}
+	for _, file := range archive.File {
+		offset, err := file.DataOffset()
+		if err != nil {
+			t.Fatalf("Failed to find data offset for %s: %v", file.Name, err)
+		}
+		ranges[file.Name] = byteRange{
+			start: offset,
+			end:   offset + int64(file.CompressedSize64),
+		}
+	}
+	return output.Bytes(), ranges
+}
+
+type testZIPEntry struct {
+	name    string
+	content []byte
+	mode    os.FileMode
+}
+
+func testPackageWithEntries(t *testing.T, entries []testZIPEntry) []byte {
+	t.Helper()
+
+	var output bytes.Buffer
+	writer := zip.NewWriter(&output)
+	writeEntry := func(entry testZIPEntry) {
+		t.Helper()
+		header := &zip.FileHeader{Name: entry.name, Method: zip.Store}
+		if entry.mode != 0 {
+			header.SetMode(entry.mode)
+		}
+		part, err := writer.CreateHeader(header)
+		if err != nil {
+			t.Fatalf("Failed to create %s: %v", entry.name, err)
+		}
+		if _, err := part.Write(entry.content); err != nil {
+			t.Fatalf("Failed to write %s: %v", entry.name, err)
+		}
+	}
+
+	writeEntry(testZIPEntry{name: "aasx/aasx-origin", content: []byte("Intentionally empty.")})
+	writeEntry(testZIPEntry{
+		name: "[Content_Types].xml",
+		content: []byte(xml.Header + `<Types xmlns="` + opcContentTypesNamespace +
+			`"><Default Extension="bin" ContentType="application/octet-stream"/>` +
+			`<Default Extension="rels" ContentType="application/xml"/>` +
+			`<Override PartName="/aasx/aasx-origin" ContentType="text/plain"/></Types>`),
+	})
+	writeEntry(testZIPEntry{
+		name: "_rels/.rels",
+		content: []byte(xml.Header + `<Relationships xmlns="` + opcRelationshipNamespace +
+			`"><Relationship Id="R1" Type="` + RelationTypeAasxOrigin +
+			`" Target="/aasx/aasx-origin"/></Relationships>`),
+	})
+	for _, entry := range entries {
+		writeEntry(entry)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close test ZIP: %v", err)
+	}
+	return output.Bytes()
+}
+
+func rewriteCentralDirectoryExpandedSize(
+	t *testing.T,
+	data []byte,
+	name string,
+	size uint32,
+) []byte {
+	t.Helper()
+	result := append([]byte(nil), data...)
+	for offset := 0; offset+46 <= len(result); offset++ {
+		if binary.LittleEndian.Uint32(result[offset:]) != 0x02014b50 {
+			continue
+		}
+		nameLength := int(binary.LittleEndian.Uint16(result[offset+28:]))
+		extraLength := int(binary.LittleEndian.Uint16(result[offset+30:]))
+		commentLength := int(binary.LittleEndian.Uint16(result[offset+32:]))
+		end := offset + 46 + nameLength + extraLength + commentLength
+		if end > len(result) {
+			t.Fatal("Malformed central directory in test ZIP")
+		}
+		entryName := string(result[offset+46 : offset+46+nameLength])
+		if entryName == name {
+			binary.LittleEndian.PutUint32(result[offset+24:], size)
+			return result
+		}
+		offset = end - 1
+	}
+	t.Fatalf("ZIP entry %s not found in central directory", name)
+	return nil
 }
 
 func relationshipTypesInZip(t *testing.T, zipData []byte) []string {
@@ -237,6 +514,525 @@ func rewriteRelationshipTargetsInZip(
 	}
 
 	return out.Bytes()
+}
+
+// =============================================================================
+// TestPackageRead - Lazy and bounded reading
+// =============================================================================
+
+func TestOpenReadFromReaderAtReadsPartsLazily(t *testing.T) {
+	data, ranges := lazyTestPackage(t)
+	blockedErr := errors.New("payload range read")
+	packaging := NewPackaging()
+
+	reader := &failingRangeReaderAt{
+		reader:  bytes.NewReader(data),
+		blocked: ranges["aasx/spec.bin"],
+		err:     blockedErr,
+	}
+	pkg, err := packaging.OpenReadFromReaderAt(reader, int64(len(data)))
+	if err != nil {
+		t.Fatalf("Opening package unexpectedly read the spec payload: %v", err)
+	}
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	if _, err := specs[0].ReadAllBytes(); !errors.Is(err, blockedErr) {
+		t.Fatalf("Expected deferred payload error, got: %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+
+	reader = &failingRangeReaderAt{
+		reader:  bytes.NewReader(data),
+		blocked: ranges["aasx/other.bin"],
+		err:     blockedErr,
+	}
+	pkg, err = packaging.OpenReadFromReaderAt(reader, int64(len(data)))
+	if err != nil {
+		t.Fatalf("Opening package unexpectedly read an unrelated payload: %v", err)
+	}
+	defer pkg.Close()
+	specs, err = pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	content, err := specs[0].ReadAllBytes()
+	if err != nil {
+		t.Fatalf("Reading spec unexpectedly read another part: %v", err)
+	}
+	if len(content) != 128*1024 {
+		t.Fatalf("Expected 128 KiB spec, got %d bytes", len(content))
+	}
+}
+
+func TestLazyReaderLimits(t *testing.T) {
+	data, _ := lazyTestPackage(t)
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to inspect test package: %v", err)
+	}
+
+	var partCount uint64
+	var metadataBytes uint64
+	var largestPart uint64
+	var totalExpanded uint64
+	for _, file := range reader.File {
+		if strings.HasSuffix(file.Name, "/") {
+			continue
+		}
+		partCount++
+		if isOPCMetadataPath(file.Name) {
+			metadataBytes += file.UncompressedSize64
+			continue
+		}
+		if file.UncompressedSize64 > largestPart {
+			largestPart = file.UncompressedSize64
+		}
+		totalExpanded += file.UncompressedSize64
+	}
+
+	packaging := NewPackaging()
+	open := func(options ...ReaderOption) error {
+		pkg, openErr := packaging.OpenReadFromReaderAt(
+			bytes.NewReader(data), int64(len(data)), options...)
+		if openErr == nil {
+			openErr = pkg.Close()
+		}
+		return openErr
+	}
+
+	if err := open(
+		WithMaxPartCount(partCount),
+		WithMaxOPCMetadataBytes(metadataBytes),
+		WithMaxPartExpandedBytes(largestPart),
+		WithMaxTotalExpandedBytes(totalExpanded),
+	); err != nil {
+		t.Fatalf("Exact reader limits should be accepted: %v", err)
+	}
+
+	limits := []ReaderOption{
+		WithMaxPartCount(partCount - 1),
+		WithMaxOPCMetadataBytes(metadataBytes - 1),
+		WithMaxPartExpandedBytes(largestPart - 1),
+		WithMaxTotalExpandedBytes(totalExpanded - 1),
+	}
+	for index, option := range limits {
+		if err := open(option); !errors.Is(err, ErrReaderLimitExceeded) {
+			t.Errorf("Limit %d: expected ErrReaderLimitExceeded, got %v", index, err)
+		}
+	}
+
+	if err := open(
+		WithMaxPartCount(0),
+		WithMaxOPCMetadataBytes(0),
+		WithMaxPartExpandedBytes(0),
+		WithMaxTotalExpandedBytes(0),
+	); err != nil {
+		t.Fatalf("Zero limits should be unlimited: %v", err)
+	}
+}
+
+func TestLazyReaderClassifiesOPCPathsExactly(t *testing.T) {
+	payload := bytes.Repeat([]byte("not XML"), 1024)
+	data := testPackageWithEntries(t, []testZIPEntry{
+		{name: "attacker_rels/bomb.rels", content: payload},
+		{name: "foo_rels/data.bin", content: []byte("visible")},
+	})
+
+	packaging := NewPackaging()
+	if _, err := packaging.OpenReadFromReaderAt(
+		bytes.NewReader(data), int64(len(data)), WithMaxPartExpandedBytes(64),
+	); !errors.Is(err, ErrReaderLimitExceeded) {
+		t.Fatalf("Near-match relationship path bypassed payload limit: %v", err)
+	}
+
+	pkg, err := packaging.OpenReadFromReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to open package with near-match paths: %v", err)
+	}
+	defer pkg.Close()
+	part, err := pkg.MustPart(mustParseURL("/foo_rels/data.bin"))
+	if err != nil {
+		t.Fatalf("Near-match payload was hidden: %v", err)
+	}
+	content, err := part.ReadAllBytes()
+	if err != nil || string(content) != "visible" {
+		t.Fatalf("Unexpected near-match payload content %q: %v", content, err)
+	}
+
+	reserved := testPackageWithEntries(t, []testZIPEntry{
+		{name: "_rels/data.bin", content: []byte("reserved")},
+	})
+	if _, err := packaging.OpenReadFromReaderAt(
+		bytes.NewReader(reserved), int64(len(reserved)),
+	); !errors.Is(err, ErrInvalidFormat) {
+		t.Fatalf("Expected invalid-format error for reserved OPC path, got %v", err)
+	}
+}
+
+func TestLazyReaderRejectsDuplicateCanonicalEntries(t *testing.T) {
+	testCases := []struct {
+		name    string
+		entries []testZIPEntry
+	}{
+		{
+			name: "same name",
+			entries: []testZIPEntry{
+				{name: "data.bin", content: []byte("first")},
+				{name: "data.bin", content: []byte("second")},
+			},
+		},
+		{
+			name: "case alias",
+			entries: []testZIPEntry{
+				{name: "Data.bin", content: []byte("first")},
+				{name: "data.bin", content: []byte("second")},
+			},
+		},
+		{
+			name: "clean path alias",
+			entries: []testZIPEntry{
+				{name: "folder/../data.bin", content: []byte("first")},
+				{name: "data.bin", content: []byte("second")},
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			data := testPackageWithEntries(t, testCase.entries)
+			_, err := NewPackaging().OpenReadFromReaderAt(
+				bytes.NewReader(data), int64(len(data)))
+			if !errors.Is(err, ErrInvalidFormat) {
+				t.Fatalf("Expected duplicate-entry format error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLazyReaderUsesFixedReadChunksAndDeclaredSizeGuard(t *testing.T) {
+	data, ranges := lazyTestPackage(t)
+	reader := &observingRangeReaderAt{
+		reader:   bytes.NewReader(data),
+		observed: ranges["aasx/spec.bin"],
+	}
+	pkg, err := NewPackaging().OpenReadFromReaderAt(reader, int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to open package: %v", err)
+	}
+	defer pkg.Close()
+	part, err := pkg.MustPart(mustParseURL("/aasx/spec.bin"))
+	if err != nil {
+		t.Fatalf("Failed to find spec: %v", err)
+	}
+	if _, err := part.ReadAllBytes(); err != nil {
+		t.Fatalf("Failed to read spec: %v", err)
+	}
+	if reader.maxReadSize > streamCopyBufferSize {
+		t.Fatalf("Payload read request was %d bytes, maximum is %d",
+			reader.maxReadSize, streamCopyBufferSize)
+	}
+
+	malformed := testPackageWithEntries(t, []testZIPEntry{
+		{name: "oversized.bin", content: bytes.Repeat([]byte{0x7f}, 64*1024)},
+	})
+	malformed = rewriteCentralDirectoryExpandedSize(t, malformed, "oversized.bin", 1)
+	pkg, err = NewPackaging().OpenReadFromReaderAt(
+		bytes.NewReader(malformed), int64(len(malformed)), WithMaxTotalExpandedBytes(64))
+	if err != nil {
+		t.Fatalf("Declared-size package should open before payload consumption: %v", err)
+	}
+	defer pkg.Close()
+	part, err = pkg.MustPart(mustParseURL("/oversized.bin"))
+	if err != nil {
+		t.Fatalf("Failed to find malformed part: %v", err)
+	}
+	content, err := part.ReadAllBytes()
+	if !errors.Is(err, zip.ErrFormat) {
+		t.Fatalf("Expected expanded-size format error, got %v", err)
+	}
+	if len(content) > 1 {
+		t.Fatalf("Read %d bytes beyond declared expanded size", len(content))
+	}
+}
+
+func TestBoundedReaderCapsChunksAndReportsLimits(t *testing.T) {
+	source := &observingReader{reader: bytes.NewReader(bytes.Repeat([]byte{0x42}, 64*1024))}
+	stream := &boundedReadCloser{
+		stream:    io.NopCloser(source),
+		remaining: 32,
+		label:     "test stream exceeds limit",
+	}
+	if read, err := stream.Read(nil); read != 0 || err != nil {
+		t.Fatalf("Zero-length read returned %d, %v", read, err)
+	}
+	content, err := io.ReadAll(stream)
+	if !errors.Is(err, ErrReaderLimitExceeded) {
+		t.Fatalf("Expected reader limit error, got %v", err)
+	}
+	if len(content) != 32 {
+		t.Fatalf("Expected 32 bytes before limit error, got %d", len(content))
+	}
+	if source.maxReadSize > streamCopyBufferSize {
+		t.Fatalf("Bounded reader requested %d bytes, maximum is %d",
+			source.maxReadSize, streamCopyBufferSize)
+	}
+}
+
+func TestLazyReaderRejectsInvalidReaderArguments(t *testing.T) {
+	packaging := NewPackaging()
+	if _, err := packaging.OpenReadFromReaderAt(nil, 0); err == nil {
+		t.Fatal("Expected nil ReaderAt to be rejected")
+	}
+	if _, err := packaging.OpenReadFromReaderAt(bytes.NewReader(nil), -1); err == nil {
+		t.Fatal("Expected negative ReaderAt size to be rejected")
+	}
+	if _, err := packaging.OpenReadFromStream(nil); err == nil {
+		t.Fatal("Expected nil ReadSeeker to be rejected")
+	}
+	seekErr := errors.New("seek failed")
+	if _, err := packaging.OpenReadFromStream(&failingReadSeeker{err: seekErr}); !errors.Is(err, seekErr) {
+		t.Fatalf("Expected ReadSeeker seek error, got %v", err)
+	}
+	adapter := &readSeekerAt{stream: bytes.NewReader(nil)}
+	if _, err := adapter.ReadAt(make([]byte, 1), -1); err == nil {
+		t.Fatal("Expected negative ReadAt offset to be rejected")
+	}
+}
+
+func TestLazyReaderIgnoresModeDirectoriesForPartLimits(t *testing.T) {
+	data := testPackageWithEntries(t, []testZIPEntry{
+		{name: "mode-directory", mode: os.ModeDir | 0755},
+	})
+	pkg, err := NewPackaging().OpenReadFromReaderAt(
+		bytes.NewReader(data), int64(len(data)), WithMaxPartCount(3))
+	if err != nil {
+		t.Fatalf("Mode-only directory counted as a part: %v", err)
+	}
+	defer pkg.Close()
+	part, err := pkg.FindPart(mustParseURL("/mode-directory"))
+	if err != nil {
+		t.Fatalf("Failed to query mode-only directory: %v", err)
+	}
+	if part != nil {
+		t.Fatal("Mode-only directory was exposed as a payload part")
+	}
+}
+
+func TestPackageReadOperationsAfterClose(t *testing.T) {
+	data, _ := lazyTestPackage(t)
+	pkg, err := NewPackaging().OpenReadFromReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to open package: %v", err)
+	}
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Repeated close failed: %v", err)
+	}
+
+	operations := []func() error{
+		func() error { _, operationErr := pkg.Specs(); return operationErr },
+		func() error { _, operationErr := pkg.SpecsByContentType(); return operationErr },
+		func() error { _, operationErr := pkg.IsSpec(specs[0]); return operationErr },
+		func() error { _, operationErr := pkg.SupplementariesFor(specs[0]); return operationErr },
+		func() error { _, operationErr := pkg.SupplementaryRelationships(); return operationErr },
+		func() error { _, operationErr := pkg.FindPart(specs[0].URI); return operationErr },
+		func() error { _, operationErr := pkg.MustPart(specs[0].URI); return operationErr },
+		func() error { _, operationErr := pkg.Thumbnail(); return operationErr },
+		func() error { _, operationErr := specs[0].Stream(); return operationErr },
+	}
+	for index, operation := range operations {
+		if err := operation(); !errors.Is(err, ErrPackageClosed) {
+			t.Errorf("Operation %d: expected ErrPackageClosed, got %v", index, err)
+		}
+	}
+}
+
+func TestPackageReadCloseRetainsErrorAndSynchronizesQueries(t *testing.T) {
+	closeErr := errors.New("close failed")
+	base := newPackageBase("", nil)
+	base.ownedCloser = &closeErrorReadCloser{Reader: bytes.NewReader(nil), err: closeErr}
+	pkg := &PackageRead{base: base}
+	if err := pkg.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("Expected close error, got %v", err)
+	}
+	if err := pkg.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("Repeated Close lost original error: %v", err)
+	}
+
+	data, _ := lazyTestPackage(t)
+	for iteration := 0; iteration < 50; iteration++ {
+		concurrent, err := NewPackaging().OpenReadFromReaderAt(
+			bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatalf("Failed to open concurrent package: %v", err)
+		}
+		var waitGroup sync.WaitGroup
+		waitGroup.Add(2)
+		go func() {
+			defer waitGroup.Done()
+			_, queryErr := concurrent.Specs()
+			if queryErr != nil && !errors.Is(queryErr, ErrPackageClosed) {
+				t.Errorf("Unexpected concurrent query error: %v", queryErr)
+			}
+		}()
+		go func() {
+			defer waitGroup.Done()
+			if closeOperationErr := concurrent.Close(); closeOperationErr != nil {
+				t.Errorf("Unexpected concurrent close error: %v", closeOperationErr)
+			}
+		}()
+		waitGroup.Wait()
+	}
+}
+
+func TestLazyReaderDefersCRCFailureUntilPartRead(t *testing.T) {
+	data, ranges := lazyTestPackage(t)
+	corrupted := append([]byte(nil), data...)
+	specRange := ranges["aasx/spec.bin"]
+	corrupted[specRange.start] ^= 0xff
+
+	pkg, err := NewPackaging().OpenReadFromReaderAt(
+		bytes.NewReader(corrupted), int64(len(corrupted)))
+	if err != nil {
+		t.Fatalf("Payload CRC failure should be deferred until reading: %v", err)
+	}
+	defer pkg.Close()
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	if _, err := specs[0].ReadAllBytes(); !errors.Is(err, zip.ErrChecksum) {
+		t.Fatalf("Expected ZIP checksum error, got %v", err)
+	}
+}
+
+func TestLazyReaderPropagatesCloseErrorsAndSizeOverflow(t *testing.T) {
+	closeErr := errors.New("close failed")
+	if _, err := readZipFile(
+		testZipFile{content: []byte("metadata"), closeErr: closeErr},
+		0,
+		false,
+		"metadata",
+	); !errors.Is(err, closeErr) {
+		t.Fatalf("Expected metadata close error, got %v", err)
+	}
+
+	if _, err := checkedExpandedTotal(^uint64(0), 1); !errors.Is(
+		err, ErrReaderLimitExceeded,
+	) {
+		t.Fatalf("Expected expanded-size overflow error, got %v", err)
+	}
+
+	base := newPackageBase("", nil)
+	base.ownedCloser = &closeErrorReadCloser{Reader: bytes.NewReader(nil), err: closeErr}
+	if err := base.close(); !errors.Is(err, closeErr) {
+		t.Fatalf("Expected owned-reader close error, got %v", err)
+	}
+	if err := base.close(); !errors.Is(err, closeErr) {
+		t.Fatalf("Expected repeated close to retain error, got %v", err)
+	}
+}
+
+func TestLazyReaderOwnershipAndClose(t *testing.T) {
+	data, _ := lazyTestPackage(t)
+	packaging := NewPackaging()
+
+	external := &closeTrackingReaderAt{Reader: bytes.NewReader(data)}
+	pkg, err := packaging.OpenReadFromReaderAt(external, int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to open external reader: %v", err)
+	}
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+	if external.closed {
+		t.Fatal("Package closed a caller-owned ReaderAt")
+	}
+	if _, err := specs[0].ReadAllBytes(); !errors.Is(err, ErrPackageClosed) {
+		t.Fatalf("Expected ErrPackageClosed, got %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Repeated Close failed: %v", err)
+	}
+
+	tmpdir, cleanup := temporaryDirectory(t)
+	defer cleanup()
+	path := filepath.Join(tmpdir, "lazy.aasx")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("Failed to write test package: %v", err)
+	}
+	pkg, err = packaging.OpenRead(path)
+	if err != nil {
+		t.Fatalf("Failed to open file package: %v", err)
+	}
+	ownedFile, ok := pkg.base.ownedCloser.(*os.File)
+	if !ok {
+		t.Fatal("OpenRead did not retain an owned file")
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close file package: %v", err)
+	}
+	if _, err := ownedFile.Stat(); err == nil {
+		t.Fatal("OpenRead-owned file remains open after Close")
+	}
+}
+
+func TestOpenReadFromStreamSupportsConcurrentPartReads(t *testing.T) {
+	data, _ := lazyTestPackage(t)
+	pkg, err := NewPackaging().OpenReadFromStream(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Failed to open stream: %v", err)
+	}
+	defer pkg.Close()
+
+	parts := make([]*Part, 0, 2)
+	for _, rawURI := range []string{"/aasx/spec.bin", "/aasx/other.bin"} {
+		part, err := pkg.MustPart(mustParseURL(rawURI))
+		if err != nil {
+			t.Fatalf("Failed to get %s: %v", rawURI, err)
+		}
+		parts = append(parts, part)
+	}
+
+	var group sync.WaitGroup
+	errorsByRead := make(chan error, 20)
+	for _, part := range parts {
+		part := part
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for index := 0; index < 10; index++ {
+				content, readErr := part.ReadAllBytes()
+				if readErr != nil {
+					errorsByRead <- readErr
+					return
+				}
+				if len(content) != 128*1024 {
+					errorsByRead <- errors.New("unexpected part size")
+					return
+				}
+			}
+		}()
+	}
+	group.Wait()
+	close(errorsByRead)
+	for readErr := range errorsByRead {
+		t.Errorf("Concurrent read failed: %v", readErr)
+	}
 }
 
 // =============================================================================
@@ -1460,8 +2256,512 @@ func TestPartStream(t *testing.T) {
 }
 
 // =============================================================================
+// TestPackageWriter
+// =============================================================================
+
+func TestPackageWriterRoundTrip(t *testing.T) {
+	destination := &switchFailWriter{err: errors.New("destination failed")}
+	writer, err := NewPackaging().CreateWriter(destination)
+	if err != nil {
+		t.Fatalf("Failed to create streaming writer: %v", err)
+	}
+
+	specContent := []byte(`{"assetAdministrationShells":[]}`)
+	spec, err := writer.PutPartFromStream(
+		mustParseURL("/aasx/spec.json"),
+		"application/json",
+		bytes.NewReader(specContent),
+	)
+	if err != nil {
+		t.Fatalf("Failed to write spec: %v", err)
+	}
+	if _, err := spec.Stream(); !errors.Is(err, ErrWriteOnlyPart) {
+		t.Fatalf("Expected write-only part error, got %v", err)
+	}
+	if err := writer.MakeSpec(spec); err != nil {
+		t.Fatalf("Failed to make spec: %v", err)
+	}
+	if err := writer.MakeSpec(spec); err != nil {
+		t.Fatalf("Repeated MakeSpec failed: %v", err)
+	}
+
+	supplementaryContent := []byte("manual")
+	supplementary, err := writer.PutPartFromStream(
+		mustParseURL("/files/manual.json"),
+		"application/pdf",
+		bytes.NewReader(supplementaryContent),
+	)
+	if err != nil {
+		t.Fatalf("Failed to write supplementary: %v", err)
+	}
+	if err := writer.RelateSupplementaryToSpec(supplementary, spec); err != nil {
+		t.Fatalf("Failed to relate supplementary: %v", err)
+	}
+	if err := writer.RelateSupplementaryToSpec(supplementary, spec); err != nil {
+		t.Fatalf("Repeated supplementary relationship failed: %v", err)
+	}
+
+	thumbnailContent := []byte("thumbnail")
+	thumbnail, err := writer.PutPartFromStream(
+		mustParseURL("/thumbnail.png"),
+		"image/png",
+		bytes.NewReader(thumbnailContent),
+	)
+	if err != nil {
+		t.Fatalf("Failed to write thumbnail: %v", err)
+	}
+	if err := writer.SetThumbnail(thumbnail); err != nil {
+		t.Fatalf("Failed to set thumbnail: %v", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close streaming writer: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Repeated Close failed: %v", err)
+	}
+	if destination.closed {
+		t.Fatal("PackageWriter closed its caller-owned destination")
+	}
+	if _, err := writer.PutPartFromStream(
+		mustParseURL("/late.bin"), "application/octet-stream", bytes.NewReader(nil),
+	); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected ErrWriterClosed, got %v", err)
+	}
+
+	pkg, err := NewPackaging().OpenReadFromReaderAt(
+		bytes.NewReader(destination.Bytes()), int64(destination.Len()))
+	if err != nil {
+		t.Fatalf("Failed to open streaming output: %v", err)
+	}
+	defer pkg.Close()
+
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	storedSpec, err := specs[0].ReadAllBytes()
+	if err != nil || !bytes.Equal(storedSpec, specContent) {
+		t.Fatalf("Spec content mismatch: %v", err)
+	}
+	if specs[0].ContentType != "application/json" {
+		t.Fatalf("Unexpected spec content type: %s", specs[0].ContentType)
+	}
+
+	supplementaries, err := pkg.SupplementariesFor(specs[0])
+	if err != nil || len(supplementaries) != 1 {
+		t.Fatalf("Expected one supplementary, got %d: %v", len(supplementaries), err)
+	}
+	storedSupplementary, err := supplementaries[0].ReadAllBytes()
+	if err != nil || !bytes.Equal(storedSupplementary, supplementaryContent) {
+		t.Fatalf("Supplementary content mismatch: %v", err)
+	}
+	if supplementaries[0].ContentType != "application/pdf" {
+		t.Fatalf("Conflicting extension content type was not preserved: %s",
+			supplementaries[0].ContentType)
+	}
+
+	storedThumbnail, err := pkg.Thumbnail()
+	if err != nil || storedThumbnail == nil {
+		t.Fatalf("Expected thumbnail: %v", err)
+	}
+	content, err := storedThumbnail.ReadAllBytes()
+	if err != nil || !bytes.Equal(content, thumbnailContent) {
+		t.Fatalf("Thumbnail content mismatch: %v", err)
+	}
+}
+
+func TestPackageWriterCopiesIncrementallyWithFixedBuffer(t *testing.T) {
+	var destination bytes.Buffer
+	writer, err := NewPackaging().CreateWriter(&destination)
+	if err != nil {
+		t.Fatalf("Failed to create streaming writer: %v", err)
+	}
+	sizeAfterCreate := destination.Len()
+	payload := incompressibleTestContent(512 * 1024)
+	source := &observingReader{reader: bytes.NewReader(payload)}
+	part, err := writer.PutPartFromStream(
+		mustParseURL("/large.bin"), "application/octet-stream", source)
+	if err != nil {
+		t.Fatalf("Failed to stream part: %v", err)
+	}
+	if source.maxReadSize > streamCopyBufferSize {
+		t.Fatalf("Source read buffer was %d bytes, maximum is %d",
+			source.maxReadSize, streamCopyBufferSize)
+	}
+	if destination.Len() <= sizeAfterCreate {
+		t.Fatal("Destination did not receive incremental part output before Close")
+	}
+	if err := writer.MakeSpec(part); err != nil {
+		t.Fatalf("Failed to make large part a spec: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close streaming writer: %v", err)
+	}
+}
+
+func TestPackageWriterRejectsDuplicateReservedAndForeignParts(t *testing.T) {
+	packaging := NewPackaging()
+	var firstOutput bytes.Buffer
+	first, err := packaging.CreateWriter(&firstOutput)
+	if err != nil {
+		t.Fatalf("Failed to create first writer: %v", err)
+	}
+	part, err := first.PutPartFromStream(
+		mustParseURL("/Data/File.bin"), "application/octet-stream", bytes.NewReader(nil))
+	if err != nil {
+		t.Fatalf("Failed to write first part: %v", err)
+	}
+	if _, err := first.PutPartFromStream(
+		mustParseURL("/data/file.bin"), "application/octet-stream", bytes.NewReader(nil),
+	); err == nil {
+		t.Fatal("Expected case-normalized duplicate part to be rejected")
+	}
+	for _, reserved := range []string{
+		"/[Content_Types].xml",
+		"/_rels/.rels",
+		"/_rels/data.bin",
+		"/folder/_rels/data.bin",
+	} {
+		if _, err := first.PutPartFromStream(
+			mustParseURL(reserved), "application/xml", bytes.NewReader(nil),
+		); err == nil {
+			t.Errorf("Expected reserved URI %s to be rejected", reserved)
+		}
+	}
+	nearMatch, err := first.PutPartFromStream(
+		mustParseURL("/foo_rels/data.bin"),
+		"application/octet-stream",
+		bytes.NewReader([]byte("visible")),
+	)
+	if err != nil {
+		t.Fatalf("Near-match OPC path should be accepted: %v", err)
+	}
+
+	var secondOutput bytes.Buffer
+	second, err := packaging.CreateWriter(&secondOutput)
+	if err != nil {
+		t.Fatalf("Failed to create second writer: %v", err)
+	}
+	if err := second.MakeSpec(part); err == nil {
+		t.Fatal("Expected foreign part handle to be rejected")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("Failed to close second writer: %v", err)
+	}
+	if err := first.MakeSpec(part); err != nil {
+		t.Fatalf("Validation errors should not poison writer: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Failed to close first writer: %v", err)
+	}
+	opened, err := packaging.OpenReadFromReaderAt(
+		bytes.NewReader(firstOutput.Bytes()), int64(firstOutput.Len()))
+	if err != nil {
+		t.Fatalf("Failed to reopen first writer output: %v", err)
+	}
+	defer opened.Close()
+	storedNearMatch, err := opened.MustPart(nearMatch.URI)
+	if err != nil {
+		t.Fatalf("Near-match writer part was hidden by reader: %v", err)
+	}
+	content, err := storedNearMatch.ReadAllBytes()
+	if err != nil || string(content) != "visible" {
+		t.Fatalf("Unexpected near-match writer content %q: %v", content, err)
+	}
+}
+
+func TestPackageWriterSnapshotsMutablePartHandles(t *testing.T) {
+	var destination bytes.Buffer
+	writer, err := NewPackaging().CreateWriter(&destination)
+	if err != nil {
+		t.Fatalf("Failed to create writer: %v", err)
+	}
+
+	spec, err := writer.PutPartFromStream(
+		mustParseURL("/original/spec.json"), "application/json", strings.NewReader("spec"))
+	if err != nil {
+		t.Fatalf("Failed to write spec: %v", err)
+	}
+	spec.URI = nil
+	spec.ContentType = "application/x-mutated"
+	if err := writer.MakeSpec(spec); err != nil {
+		t.Fatalf("Mutated spec handle was not treated as an opaque handle: %v", err)
+	}
+
+	supplementaryURIs := []string{"/original/manual.pdf", "/original/schema.xml"}
+	for _, rawURI := range supplementaryURIs {
+		supplementary, putErr := writer.PutPartFromStream(
+			mustParseURL(rawURI), "application/octet-stream", strings.NewReader(rawURI))
+		if putErr != nil {
+			t.Fatalf("Failed to write supplementary %s: %v", rawURI, putErr)
+		}
+		supplementary.URI = mustParseURL("/mutated.bin")
+		supplementary.ContentType = "application/x-mutated"
+		if relateErr := writer.RelateSupplementaryToSpec(supplementary, spec); relateErr != nil {
+			t.Fatalf("Failed to relate mutated supplementary handle: %v", relateErr)
+		}
+	}
+
+	thumbnail, err := writer.PutPartFromStream(
+		mustParseURL("/original/thumbnail.png"), "image/png", strings.NewReader("thumbnail"))
+	if err != nil {
+		t.Fatalf("Failed to write thumbnail: %v", err)
+	}
+	thumbnail.URI = mustParseURL("/mutated.png")
+	thumbnail.ContentType = "application/x-mutated"
+	if err := writer.SetThumbnail(thumbnail); err != nil {
+		t.Fatalf("Failed to set mutated thumbnail handle: %v", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close writer: %v", err)
+	}
+	pkg, err := NewPackaging().OpenReadFromReaderAt(
+		bytes.NewReader(destination.Bytes()), int64(destination.Len()))
+	if err != nil {
+		t.Fatalf("Failed to open writer output: %v", err)
+	}
+	defer pkg.Close()
+
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one snapshotted spec, got %d: %v", len(specs), err)
+	}
+	if specs[0].URI.String() != "/original/spec.json" || specs[0].ContentType != "application/json" {
+		t.Fatalf("Spec metadata followed mutable handle: %s, %s",
+			specs[0].URI.String(), specs[0].ContentType)
+	}
+	supplementaries, err := pkg.SupplementariesFor(specs[0])
+	if err != nil || len(supplementaries) != len(supplementaryURIs) {
+		t.Fatalf("Expected %d supplementaries, got %d: %v",
+			len(supplementaryURIs), len(supplementaries), err)
+	}
+	for _, rawURI := range supplementaryURIs {
+		if _, err := pkg.MustPart(mustParseURL(rawURI)); err != nil {
+			t.Errorf("Snapshotted supplementary %s not found: %v", rawURI, err)
+		}
+	}
+	storedThumbnail, err := pkg.Thumbnail()
+	if err != nil || storedThumbnail == nil {
+		t.Fatalf("Expected snapshotted thumbnail: %v", err)
+	}
+	if storedThumbnail.URI.String() != "/original/thumbnail.png" ||
+		storedThumbnail.ContentType != "image/png" {
+		t.Fatalf("Thumbnail metadata followed mutable handle: %s, %s",
+			storedThumbnail.URI.String(), storedThumbnail.ContentType)
+	}
+}
+
+func TestBuildContentTypesIsDeterministicForConflictingExtensions(t *testing.T) {
+	first := buildContentTypesForParts([]contentTypePart{
+		{path: "/z/data.json", contentType: "application/x-z"},
+		{path: "/a/data.json", contentType: "application/x-a"},
+		{path: "/without-extension", contentType: "application/octet-stream"},
+	})
+	second := buildContentTypesForParts([]contentTypePart{
+		{path: "/without-extension", contentType: "application/octet-stream"},
+		{path: "/a/data.json", contentType: "application/x-a"},
+		{path: "/z/data.json", contentType: "application/x-z"},
+	})
+	firstXML, err := xml.Marshal(first)
+	if err != nil {
+		t.Fatalf("Failed to marshal first content types: %v", err)
+	}
+	secondXML, err := xml.Marshal(second)
+	if err != nil {
+		t.Fatalf("Failed to marshal second content types: %v", err)
+	}
+	if !bytes.Equal(firstXML, secondXML) {
+		t.Fatalf("Content types depend on part insertion order:\n%s\n%s", firstXML, secondXML)
+	}
+
+	var jsonDefault string
+	for _, defaultContentType := range first.Defaults {
+		if defaultContentType.Extension == "json" {
+			jsonDefault = defaultContentType.ContentType
+		}
+	}
+	if jsonDefault != "application/x-a" {
+		t.Fatalf("Expected lexically first JSON part to define default, got %s", jsonDefault)
+	}
+}
+
+func TestPackageWriterValidatesInputsAndClosedState(t *testing.T) {
+	packaging := NewPackaging()
+	if _, err := packaging.CreateWriter(nil); err == nil {
+		t.Fatal("Expected nil destination to be rejected")
+	}
+
+	var nilWriter *PackageWriter
+	if _, err := nilWriter.PutPartFromStream(nil, "", nil); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected nil writer Put error, got %v", err)
+	}
+	if err := nilWriter.MakeSpec(nil); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected nil writer MakeSpec error, got %v", err)
+	}
+	if err := nilWriter.RelateSupplementaryToSpec(nil, nil); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected nil writer relationship error, got %v", err)
+	}
+	if err := nilWriter.SetThumbnail(nil); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected nil writer thumbnail error, got %v", err)
+	}
+	if err := nilWriter.Close(); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Expected nil writer Close error, got %v", err)
+	}
+
+	var destination bytes.Buffer
+	writer, err := packaging.CreateWriter(&destination)
+	if err != nil {
+		t.Fatalf("Failed to create writer: %v", err)
+	}
+	if _, err := writer.PutPartFromStream(
+		mustParseURL("/nil-stream.bin"), "application/octet-stream", nil,
+	); err == nil {
+		t.Fatal("Expected nil part stream to be rejected")
+	}
+	invalidURIs := []*url.URL{
+		nil,
+		{},
+		mustParseURL("https://example.com/external.bin"),
+		mustParseURL("/"),
+		mustParseURL("/directory/"),
+		mustParseURL("/query.bin?value=1"),
+		mustParseURL("/fragment.bin#value"),
+	}
+	for index, uri := range invalidURIs {
+		if _, err := writer.PutPartFromStream(
+			uri, "application/octet-stream", bytes.NewReader(nil),
+		); err == nil {
+			t.Errorf("Invalid URI %d was accepted", index)
+		}
+	}
+	if err := writer.MakeSpec(nil); err == nil {
+		t.Fatal("Expected nil part handle to be rejected")
+	}
+	part, err := writer.PutPartFromStream(
+		mustParseURL("/part.bin"), "application/octet-stream", bytes.NewReader(nil))
+	if err != nil {
+		t.Fatalf("Failed to write valid part: %v", err)
+	}
+	if err := writer.RelateSupplementaryToSpec(part, part); err == nil {
+		t.Fatal("Expected relationship to an unmarked spec to be rejected")
+	}
+	if err := writer.SetThumbnail(nil); err == nil {
+		t.Fatal("Expected nil thumbnail handle to be rejected")
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Validation errors poisoned writer: %v", err)
+	}
+	closedOperations := []func() error{
+		func() error { return writer.MakeSpec(part) },
+		func() error { return writer.RelateSupplementaryToSpec(part, part) },
+		func() error { return writer.SetThumbnail(part) },
+	}
+	for index, operation := range closedOperations {
+		if err := operation(); !errors.Is(err, ErrWriterClosed) {
+			t.Errorf("Closed writer operation %d returned %v", index, err)
+		}
+	}
+}
+
+func TestPackageWriterPropagatesAndRetainsFailures(t *testing.T) {
+	sourceErr := errors.New("source failed")
+	var destination bytes.Buffer
+	writer, err := NewPackaging().CreateWriter(&destination)
+	if err != nil {
+		t.Fatalf("Failed to create streaming writer: %v", err)
+	}
+	_, err = writer.PutPartFromStream(
+		mustParseURL("/broken.bin"),
+		"application/octet-stream",
+		&errorAfterReader{content: []byte("partial"), err: sourceErr},
+	)
+	if !errors.Is(err, sourceErr) {
+		t.Fatalf("Expected source failure, got %v", err)
+	}
+	if _, err := writer.PutPartFromStream(
+		mustParseURL("/later.bin"), "application/octet-stream", bytes.NewReader(nil),
+	); !errors.Is(err, sourceErr) {
+		t.Fatalf("Expected retained source failure, got %v", err)
+	}
+	if err := writer.Close(); !errors.Is(err, sourceErr) {
+		t.Fatalf("Close did not return retained source failure: %v", err)
+	}
+	if err := writer.Close(); !errors.Is(err, sourceErr) {
+		t.Fatalf("Repeated Close did not return retained failure: %v", err)
+	}
+
+	destinationErr := errors.New("destination failed")
+	failingDestination := &switchFailWriter{err: destinationErr}
+	writer, err = NewPackaging().CreateWriter(failingDestination)
+	if err != nil {
+		t.Fatalf("Failed to create writer before enabling destination failure: %v", err)
+	}
+	failingDestination.fail = true
+	_, putErr := writer.PutPartFromStream(
+		mustParseURL("/large.bin"),
+		"application/octet-stream",
+		bytes.NewReader(incompressibleTestContent(128*1024)),
+	)
+	if putErr == nil {
+		putErr = writer.Close()
+	} else {
+		_ = writer.Close()
+	}
+	if !errors.Is(putErr, destinationErr) {
+		t.Fatalf("Expected destination failure, got %v", putErr)
+	}
+}
+
+// =============================================================================
 // TestPackageReadWrite (Create)
 // =============================================================================
+
+func TestPackageReadWriteOperationsAfterClose(t *testing.T) {
+	var destination bytes.Buffer
+	pkg, err := NewPackaging().CreateInStream(&readWriteSeeker{buf: &destination})
+	if err != nil {
+		t.Fatalf("Failed to create package: %v", err)
+	}
+	part, err := pkg.PutPart(
+		mustParseURL("/part.bin"), "application/octet-stream", []byte("part"))
+	if err != nil {
+		t.Fatalf("Failed to add part: %v", err)
+	}
+	if err := pkg.MakeSpec(part); err != nil {
+		t.Fatalf("Failed to make spec: %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+
+	operations := []func() error{
+		func() error {
+			_, operationErr := pkg.PutPart(
+				mustParseURL("/late.bin"), "application/octet-stream", nil)
+			return operationErr
+		},
+		func() error {
+			_, operationErr := pkg.PutPartFromStream(
+				mustParseURL("/late-stream.bin"), "application/octet-stream", bytes.NewReader(nil))
+			return operationErr
+		},
+		func() error { return pkg.DeletePart(part) },
+		func() error { return pkg.MakeSpec(part) },
+		func() error { return pkg.UnmakeSpec(part) },
+		func() error { return pkg.RelateSupplementaryToSpec(part, part) },
+		func() error { return pkg.UnrelateSupplementaryFromSpec(part, part) },
+		func() error { return pkg.SetThumbnail(part) },
+		func() error { return pkg.UnsetThumbnail() },
+		func() error { return pkg.Flush() },
+	}
+	for index, operation := range operations {
+		if err := operation(); !errors.Is(err, ErrPackageClosed) {
+			t.Errorf("Operation %d: expected ErrPackageClosed, got %v", index, err)
+		}
+	}
+}
 
 func TestCreateNewPackage(t *testing.T) {
 	tmpdir, cleanup := temporaryDirectory(t)

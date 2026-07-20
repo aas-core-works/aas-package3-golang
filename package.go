@@ -40,9 +40,13 @@ const (
 
 // Common errors
 var (
-	ErrNoOriginPart  = errors.New("no origin part found")
-	ErrPartNotFound  = errors.New("part not found")
-	ErrInvalidFormat = errors.New("invalid package format")
+	ErrNoOriginPart        = errors.New("no origin part found")
+	ErrPartNotFound        = errors.New("part not found")
+	ErrInvalidFormat       = errors.New("invalid package format")
+	ErrReaderLimitExceeded = errors.New("reader limit exceeded")
+	ErrPackageClosed       = errors.New("package is closed")
+	ErrWriterClosed        = errors.New("package writer is closed")
+	ErrWriteOnlyPart       = errors.New("part belongs to a write-only package")
 )
 
 // region OPC XML Types
@@ -92,6 +96,184 @@ type relationship struct {
 
 // endregion
 
+// region Lazy Reader Options and Helpers
+
+const streamCopyBufferSize = 32 * 1024
+
+// ReaderOption configures the resource limits applied while opening and
+// reading a package. A limit of zero means unlimited.
+type ReaderOption func(*readerOptions)
+
+type readerOptions struct {
+	maxPartCount          uint64
+	maxOPCMetadataBytes   uint64
+	maxPartExpandedBytes  uint64
+	maxTotalExpandedBytes uint64
+}
+
+// WithMaxPartCount limits the number of non-directory ZIP entries.
+func WithMaxPartCount(max uint64) ReaderOption {
+	return func(options *readerOptions) {
+		options.maxPartCount = max
+	}
+}
+
+// WithMaxOPCMetadataBytes limits the combined expanded size of
+// [Content_Types].xml and relationship parts.
+func WithMaxOPCMetadataBytes(max uint64) ReaderOption {
+	return func(options *readerOptions) {
+		options.maxOPCMetadataBytes = max
+	}
+}
+
+// WithMaxPartExpandedBytes limits the expanded size of each payload part.
+func WithMaxPartExpandedBytes(max uint64) ReaderOption {
+	return func(options *readerOptions) {
+		options.maxPartExpandedBytes = max
+	}
+}
+
+// WithMaxTotalExpandedBytes limits the combined expanded size of all payload
+// parts. OPC metadata is governed by WithMaxOPCMetadataBytes instead.
+func WithMaxTotalExpandedBytes(max uint64) ReaderOption {
+	return func(options *readerOptions) {
+		options.maxTotalExpandedBytes = max
+	}
+}
+
+func applyReaderOptions(options []ReaderOption) readerOptions {
+	var result readerOptions
+	for _, option := range options {
+		if option != nil {
+			option(&result)
+		}
+	}
+	return result
+}
+
+// readSeekerAt adapts an io.ReadSeeker to io.ReaderAt. ZIP readers can issue
+// concurrent ReadAt calls, so seeking and reading must be one critical section.
+type readSeekerAt struct {
+	stream io.ReadSeeker
+	mu     sync.Mutex
+}
+
+func (reader *readSeekerAt) ReadAt(buffer []byte, offset int64) (int, error) {
+	if offset < 0 {
+		return 0, fmt.Errorf("negative read offset: %d", offset)
+	}
+
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+
+	if _, err := reader.stream.Seek(offset, io.SeekStart); err != nil {
+		return 0, err
+	}
+
+	read, err := io.ReadFull(reader.stream, buffer)
+	if err == io.ErrUnexpectedEOF {
+		err = io.EOF
+	}
+	return read, err
+}
+
+type boundedReadCloser struct {
+	stream    io.ReadCloser
+	remaining uint64
+	label     string
+	limitErr  error
+}
+
+func (reader *boundedReadCloser) Read(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
+	}
+
+	if reader.remaining == 0 {
+		var probe [1]byte
+		read, err := reader.stream.Read(probe[:])
+		if read > 0 {
+			limitErr := reader.limitErr
+			if limitErr == nil {
+				limitErr = ErrReaderLimitExceeded
+			}
+			return 0, fmt.Errorf("%w: %s", limitErr, reader.label)
+		}
+		return 0, err
+	}
+
+	if len(buffer) > streamCopyBufferSize {
+		buffer = buffer[:streamCopyBufferSize]
+	}
+	if uint64(len(buffer)) > reader.remaining {
+		buffer = buffer[:int(reader.remaining)]
+	}
+	read, err := reader.stream.Read(buffer)
+	reader.remaining -= uint64(read)
+	return read, err
+}
+
+func (reader *boundedReadCloser) Close() error {
+	return reader.stream.Close()
+}
+
+func readZipFile(file zipFile, max uint64, limited bool, label string) ([]byte, error) {
+	if limited && file.uncompressedSize() > max {
+		return nil, fmt.Errorf(
+			"%w: %s is %d bytes, maximum is %d",
+			ErrReaderLimitExceeded,
+			label,
+			file.uncompressedSize(),
+			max,
+		)
+	}
+
+	stream, err := file.open()
+	if err != nil {
+		return nil, err
+	}
+	if limited {
+		stream = &boundedReadCloser{
+			stream:    stream,
+			remaining: max,
+			label:     label,
+		}
+	}
+
+	var result bytes.Buffer
+	buffer := make([]byte, streamCopyBufferSize)
+	_, readErr := io.CopyBuffer(&result, struct{ io.Reader }{stream}, buffer)
+	closeErr := stream.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return result.Bytes(), nil
+}
+
+// zipFile is the small portion of archive/zip.File used by the bounded reader
+// helper. Keeping it as an interface makes limit and close failures testable.
+type zipFile interface {
+	open() (io.ReadCloser, error)
+	uncompressedSize() uint64
+}
+
+type archiveZipFile struct {
+	file *zip.File
+}
+
+func (file archiveZipFile) open() (io.ReadCloser, error) {
+	return file.file.Open()
+}
+
+func (file archiveZipFile) uncompressedSize() uint64 {
+	return file.file.UncompressedSize64
+}
+
+// endregion
+
 // region Part
 
 // Part represents a part of an AAS package.
@@ -105,26 +287,72 @@ type Part struct {
 	// content holds the byte content of the part
 	content []byte
 
-	// pkg is a reference back to the package (for lazy loading if needed)
+	// archiveFile references the underlying ZIP entry for lazy read packages.
+	archiveFile *zip.File
+
+	// pkg is a reference back to the package.
 	pkg *packageBase
+
+	// writeOnly identifies lightweight handles returned by PackageWriter.
+	writeOnly bool
 }
 
 // Stream opens a read stream for the part content.
 // The caller is responsible for closing the returned ReadCloser.
 func (p *Part) Stream() (io.ReadCloser, error) {
+	if p == nil {
+		return nil, ErrPartNotFound
+	}
+	if p.writeOnly {
+		return nil, ErrWriteOnlyPart
+	}
+	if p.pkg != nil {
+		p.pkg.mu.RLock()
+		defer p.pkg.mu.RUnlock()
+		if p.pkg.closed {
+			return nil, ErrPackageClosed
+		}
+	}
+	if p.archiveFile != nil {
+		stream, err := p.archiveFile.Open()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open part %s: %w", p.URI.String(), err)
+		}
+		stream = &boundedReadCloser{
+			stream:    stream,
+			remaining: p.archiveFile.UncompressedSize64,
+			label:     fmt.Sprintf("part %s exceeds its declared expanded size", p.URI.String()),
+			limitErr:  zip.ErrFormat,
+		}
+		return stream, nil
+	}
 	return io.NopCloser(bytes.NewReader(p.content)), nil
 }
 
 // ReadAllBytes reads the whole content of the part as bytes.
 func (p *Part) ReadAllBytes() ([]byte, error) {
-	result := make([]byte, len(p.content))
-	copy(result, p.content)
+	stream, err := p.Stream()
+	if err != nil {
+		return nil, err
+	}
+	result, readErr := io.ReadAll(stream)
+	closeErr := stream.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
 	return result, nil
 }
 
 // ReadAllText reads the content of the part as UTF-8 text.
 func (p *Part) ReadAllText() (string, error) {
-	return string(p.content), nil
+	content, err := p.ReadAllBytes()
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
 }
 
 // SupplementaryRelationship represents a relationship between a spec and its supplementary part.
@@ -246,60 +474,49 @@ func (p *Packaging) CreateInStream(stream io.ReadWriteSeeker) (*PackageReadWrite
 	return result, nil
 }
 
-// OpenRead opens an AAS package at the given path for reading.
-// Returns a PackageRead instance or an error.
-func (p *Packaging) OpenRead(path string) (*PackageRead, error) {
-	// Open and read the zip file
-	data, err := os.ReadFile(path)
+// OpenRead opens an AAS package at the given path for lazy reading.
+// The package owns the opened file and releases it in PackageRead.Close.
+func (p *Packaging) OpenRead(path string, options ...ReaderOption) (*PackageRead, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("failed to stat file: %w", err)
 	}
 
-	reader := bytes.NewReader(data)
-	pkg, err := p.openFromReader(reader, int64(len(data)), path)
+	result, err := p.openReadFromReaderAt(file, info.Size(), path, file, options)
 	if err != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			return nil, fmt.Errorf("%w; additionally failed to close file: %v", err, closeErr)
+		}
 		return nil, err
 	}
-	pkg.readWrite = false
-
-	result := &PackageRead{
-		Path: path,
-		base: pkg,
-	}
-
 	Ensure(result.Path == path, "The Path property of the package must match the input path.")
-
 	return result, nil
 }
 
 // OpenReadFromStream opens an AAS package from the given stream for reading.
 // Returns a PackageRead instance or an error.
-func (p *Packaging) OpenReadFromStream(stream io.ReadSeeker) (*PackageRead, error) {
+func (p *Packaging) OpenReadFromStream(
+	stream io.ReadSeeker,
+	options ...ReaderOption,
+) (*PackageRead, error) {
+	if stream == nil {
+		return nil, errors.New("stream must not be nil")
+	}
+
 	// Get the stream size
 	size, err := stream.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to seek stream: %w", err)
 	}
-	if _, err := stream.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("failed to reset stream: %w", err)
-	}
-
-	// Read all data into memory for zip.NewReader
-	data := make([]byte, size)
-	if _, err := io.ReadFull(stream, data); err != nil {
-		return nil, fmt.Errorf("failed to read stream: %w", err)
-	}
-
-	reader := bytes.NewReader(data)
-	pkg, err := p.openFromReader(reader, size, "")
+	result, err := p.openReadFromReaderAt(
+		&readSeekerAt{stream: stream}, size, "", nil, options)
 	if err != nil {
 		return nil, err
-	}
-	pkg.readWrite = false
-
-	result := &PackageRead{
-		Path: "",
-		base: pkg,
 	}
 
 	Ensure(
@@ -307,6 +524,39 @@ func (p *Packaging) OpenReadFromStream(stream io.ReadSeeker) (*PackageRead, erro
 		"The Path property of the package must be empty if reading from a stream.")
 
 	return result, nil
+}
+
+// OpenReadFromReaderAt opens an AAS package lazily from a random-access reader.
+// The caller retains ownership of reader and must keep it usable until Close.
+func (p *Packaging) OpenReadFromReaderAt(
+	reader io.ReaderAt,
+	size int64,
+	options ...ReaderOption,
+) (*PackageRead, error) {
+	return p.openReadFromReaderAt(reader, size, "", nil, options)
+}
+
+func (p *Packaging) openReadFromReaderAt(
+	reader io.ReaderAt,
+	size int64,
+	path string,
+	ownedCloser io.Closer,
+	options []ReaderOption,
+) (*PackageRead, error) {
+	if reader == nil {
+		return nil, errors.New("reader must not be nil")
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("reader size must not be negative: %d", size)
+	}
+
+	pkg, err := p.openPackage(reader, size, path, true, applyReaderOptions(options))
+	if err != nil {
+		return nil, err
+	}
+	pkg.readWrite = false
+	pkg.ownedCloser = ownedCloser
+	return &PackageRead{Path: path, base: pkg}, nil
 }
 
 // OpenReadWrite opens an AAS package at the given path for read/write.
@@ -379,11 +629,21 @@ func (p *Packaging) OpenReadWriteFromStream(
 	return result, nil
 }
 
-// openFromReader opens an OPC package from a reader
+// openFromReader materializes an OPC package for the mutable compatibility API.
 func (p *Packaging) openFromReader(
-	reader *bytes.Reader,
+	reader io.ReaderAt,
 	size int64,
 	path string,
+) (*packageBase, error) {
+	return p.openPackage(reader, size, path, false, readerOptions{})
+}
+
+func (p *Packaging) openPackage(
+	reader io.ReaderAt,
+	size int64,
+	path string,
+	lazy bool,
+	options readerOptions,
 ) (*packageBase, error) {
 	zipReader, err := zip.NewReader(reader, size)
 	if err != nil {
@@ -391,18 +651,85 @@ func (p *Packaging) openFromReader(
 	}
 
 	pkg := newPackageBase(path, nil)
+	pkg.readerOptions = options
+
+	var partCount uint64
+	var totalExpanded uint64
+	entryPaths := make(map[string]string)
+	for _, file := range zipReader.File {
+		if isZIPDirectory(file) {
+			continue
+		}
+		canonicalPath := normalizePathForMap(file.Name)
+		if previous, exists := entryPaths[canonicalPath]; exists {
+			return nil, fmt.Errorf(
+				"%w: duplicate ZIP entries %q and %q", ErrInvalidFormat, previous, file.Name)
+		}
+		entryPaths[canonicalPath] = file.Name
+		if isReservedOPCPath(file.Name) && !isOPCMetadataPath(file.Name) {
+			return nil, fmt.Errorf(
+				"%w: invalid entry in reserved OPC location: %s", ErrInvalidFormat, file.Name)
+		}
+		partCount++
+		if options.maxPartCount != 0 && partCount > options.maxPartCount {
+			return nil, fmt.Errorf(
+				"%w: package has more than %d parts",
+				ErrReaderLimitExceeded,
+				options.maxPartCount,
+			)
+		}
+		if isOPCMetadataPath(file.Name) {
+			continue
+		}
+		if options.maxPartExpandedBytes != 0 &&
+			file.UncompressedSize64 > options.maxPartExpandedBytes {
+			return nil, fmt.Errorf(
+				"%w: part %s is %d bytes, maximum is %d",
+				ErrReaderLimitExceeded,
+				file.Name,
+				file.UncompressedSize64,
+				options.maxPartExpandedBytes,
+			)
+		}
+		totalExpanded, err = checkedExpandedTotal(totalExpanded, file.UncompressedSize64)
+		if err != nil {
+			return nil, err
+		}
+		if options.maxTotalExpandedBytes != 0 &&
+			totalExpanded > options.maxTotalExpandedBytes {
+			return nil, fmt.Errorf(
+				"%w: total expanded size is more than %d bytes",
+				ErrReaderLimitExceeded,
+				options.maxTotalExpandedBytes,
+			)
+		}
+	}
+
+	var metadataBytes uint64
+	readMetadata := func(file *zip.File, label string) ([]byte, error) {
+		max := options.maxOPCMetadataBytes
+		remaining := uint64(0)
+		limited := max != 0
+		if limited {
+			if metadataBytes > max {
+				return nil, fmt.Errorf("%w: OPC metadata exceeds %d bytes", ErrReaderLimitExceeded, max)
+			}
+			remaining = max - metadataBytes
+		}
+		data, readErr := readZipFile(archiveZipFile{file: file}, remaining, limited, label)
+		if readErr != nil {
+			return nil, readErr
+		}
+		metadataBytes += uint64(len(data))
+		return data, nil
+	}
 
 	// Read [Content_Types].xml
 	contentTypes := make(map[string]string) // path -> contentType
 	defaultTypes := make(map[string]string) // extension -> contentType
 	for _, file := range zipReader.File {
-		if file.Name == "[Content_Types].xml" {
-			rc, err := file.Open()
-			if err != nil {
-				return nil, fmt.Errorf("failed to open content types: %w", err)
-			}
-			data, err := io.ReadAll(rc)
-			rc.Close()
+		if isContentTypesPath(file.Name) {
+			data, err := readMetadata(file, "OPC content types")
 			if err != nil {
 				return nil, fmt.Errorf("failed to read content types: %w", err)
 			}
@@ -425,13 +752,8 @@ func (p *Packaging) openFromReader(
 	// Read all relationships files
 	for _, file := range zipReader.File {
 		relsPath := strings.ReplaceAll(file.Name, "\\", "/")
-		if strings.Contains(relsPath, "_rels/") && strings.HasSuffix(relsPath, ".rels") {
-			rc, err := file.Open()
-			if err != nil {
-				return nil, fmt.Errorf("failed to open rels file %s: %w", file.Name, err)
-			}
-			data, err := io.ReadAll(rc)
-			rc.Close()
+		if isRelationshipPartPath(relsPath) {
+			data, err := readMetadata(file, fmt.Sprintf("relationship part %s", file.Name))
 			if err != nil {
 				return nil, fmt.Errorf("failed to read rels file %s: %w", file.Name, err)
 			}
@@ -464,20 +786,8 @@ func (p *Packaging) openFromReader(
 	// Read all parts (excluding rels files and content types)
 	for _, file := range zipReader.File {
 		zipPath := strings.ReplaceAll(file.Name, "\\", "/")
-		if zipPath == "[Content_Types].xml" ||
-			strings.Contains(zipPath, "_rels/") ||
-			strings.HasSuffix(zipPath, "/") {
+		if isOPCMetadataPath(zipPath) || isZIPDirectory(file) {
 			continue
-		}
-
-		rc, err := file.Open()
-		if err != nil {
-			return nil, fmt.Errorf("failed to open part %s: %w", file.Name, err)
-		}
-		data, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read part %s: %w", file.Name, err)
 		}
 
 		partPath := "/" + strings.TrimPrefix(zipPath, "/")
@@ -497,12 +807,22 @@ func (p *Packaging) openFromReader(
 		}
 
 		partURI, _ := url.Parse(partPath)
-		pkg.parts[normalizedPath] = &Part{
+		part := &Part{
 			URI:         partURI,
 			ContentType: contentType,
-			content:     data,
 			pkg:         pkg,
 		}
+		if lazy {
+			part.archiveFile = file
+		} else {
+			data, readErr := readZipFile(
+				archiveZipFile{file: file}, 0, false, fmt.Sprintf("part %s", file.Name))
+			if readErr != nil {
+				return nil, fmt.Errorf("failed to read part %s: %w", file.Name, readErr)
+			}
+			part.content = data
+		}
+		pkg.parts[normalizedPath] = part
 	}
 
 	return pkg, nil
@@ -521,6 +841,10 @@ type packageBase struct {
 	originURI     string                    // normalized path to origin part
 	readWrite     bool
 	nextRelID     int
+	readerOptions readerOptions
+	ownedCloser   io.Closer
+	closed        bool
+	closeErr      error
 	mu            sync.RWMutex
 }
 
@@ -532,6 +856,20 @@ func newPackageBase(path string, stream io.ReadWriteSeeker) *packageBase {
 		relationships: make(map[string][]relationship),
 		nextRelID:     1,
 	}
+}
+
+func (pkg *packageBase) close() error {
+	pkg.mu.Lock()
+	defer pkg.mu.Unlock()
+	if pkg.closed {
+		return pkg.closeErr
+	}
+	pkg.closed = true
+	if pkg.ownedCloser != nil {
+		pkg.closeErr = pkg.ownedCloser.Close()
+		pkg.ownedCloser = nil
+	}
+	return pkg.closeErr
 }
 
 func (pkg *packageBase) addRelationship(sourcePath, targetPath, relType string) string {
@@ -611,22 +949,52 @@ type PackageRead struct {
 
 // Close closes the package and releases all resources.
 func (p *PackageRead) Close() error {
-	// Clear references
-	p.base = nil
-	return nil
+	if p == nil || p.base == nil {
+		return nil
+	}
+	return p.base.close()
+}
+
+func (p *PackageRead) lockBaseForRead() (*packageBase, error) {
+	if p == nil || p.base == nil {
+		return nil, ErrPackageClosed
+	}
+	base := p.base
+	base.mu.RLock()
+	if base.closed {
+		base.mu.RUnlock()
+		return nil, ErrPackageClosed
+	}
+	return base, nil
+}
+
+func (p *PackageRead) lockBaseForWrite() (*packageBase, error) {
+	if p == nil || p.base == nil {
+		return nil, ErrPackageClosed
+	}
+	base := p.base
+	base.mu.Lock()
+	if base.closed {
+		base.mu.Unlock()
+		return nil, ErrPackageClosed
+	}
+	return base, nil
 }
 
 // Specs returns all AAS spec parts contained in the package.
 func (p *PackageRead) Specs() ([]*Part, error) {
-	p.base.mu.RLock()
-	defer p.base.mu.RUnlock()
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return nil, err
+	}
+	defer base.mu.RUnlock()
 
 	var result []*Part
-	rels := p.base.getRelationshipsByType(p.base.originURI, RelationTypeAasxSpec)
+	rels := base.getRelationshipsByType(base.originURI, RelationTypeAasxSpec)
 
 	for _, rel := range rels {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if part, ok := p.base.parts[normalizedTarget]; ok {
+		if part, ok := base.parts[normalizedTarget]; ok {
 			result = append(result, part)
 		}
 	}
@@ -665,23 +1033,29 @@ func (p *PackageRead) SpecsByContentType() (map[string][]*Part, error) {
 
 // IsSpec checks whether the given part is related to the origin of the package as a spec.
 func (p *PackageRead) IsSpec(part *Part) (bool, error) {
-	p.base.mu.RLock()
-	defer p.base.mu.RUnlock()
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return false, err
+	}
+	defer base.mu.RUnlock()
 
-	return p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec), nil
+	return base.hasRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec), nil
 }
 
 // SupplementariesFor returns all supplementary parts for the given spec.
 func (p *PackageRead) SupplementariesFor(spec *Part) ([]*Part, error) {
-	p.base.mu.RLock()
-	defer p.base.mu.RUnlock()
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return nil, err
+	}
+	defer base.mu.RUnlock()
 
 	var result []*Part
-	rels := p.base.getRelationshipsByType(spec.URI.String(), RelationTypeAasxSupplementary)
+	rels := base.getRelationshipsByType(spec.URI.String(), RelationTypeAasxSupplementary)
 
 	for _, rel := range rels {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if part, ok := p.base.parts[normalizedTarget]; ok {
+		if part, ok := base.parts[normalizedTarget]; ok {
 			result = append(result, part)
 		} else {
 			return nil, fmt.Errorf("supplementary part %s not found", rel.target)
@@ -718,11 +1092,14 @@ func (p *PackageRead) SupplementaryRelationships() ([]*SupplementaryRelationship
 // FindPart tries to find the package part with the given URI.
 // Returns nil if the part does not exist.
 func (p *PackageRead) FindPart(uri *url.URL) (*Part, error) {
-	p.base.mu.RLock()
-	defer p.base.mu.RUnlock()
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return nil, err
+	}
+	defer base.mu.RUnlock()
 
 	normalizedURI := normalizeURI(uri)
-	if part, ok := p.base.parts[normalizedURI]; ok {
+	if part, ok := base.parts[normalizedURI]; ok {
 		return part, nil
 	}
 	return nil, nil
@@ -744,22 +1121,355 @@ func (p *PackageRead) MustPart(uri *url.URL) (*Part, error) {
 // Thumbnail retrieves the thumbnail from the AAS package.
 // Returns nil if no thumbnail exists in the package.
 func (p *PackageRead) Thumbnail() (*Part, error) {
-	p.base.mu.RLock()
-	defer p.base.mu.RUnlock()
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return nil, err
+	}
+	defer base.mu.RUnlock()
 
 	// Look for thumbnail relationship from root
-	rels := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	rels := base.getRelationshipsByType("", RelationTypeThumbnail)
 
 	if len(rels) > 0 {
 		rel := rels[0]
 		normalizedTarget := normalizePathForMap(rel.target)
-		if part, ok := p.base.parts[normalizedTarget]; ok {
+		if part, ok := base.parts[normalizedTarget]; ok {
 			return part, nil
 		}
 		return nil, fmt.Errorf("thumbnail relationship exists but part not found: %s", rel.target)
 	}
 
 	return nil, nil
+}
+
+// endregion
+
+// region PackageWriter
+
+// PackageWriter writes a new AAS package incrementally. It is append-only and
+// retains only part and relationship metadata in memory.
+type PackageWriter struct {
+	archiveWriter *zip.Writer
+	base          *packageBase
+	parts         map[string]*writerPartMetadata
+	handles       map[*Part]*writerPartMetadata
+	failure       error
+	closed        bool
+	closeErr      error
+	mu            sync.Mutex
+}
+
+type writerPartMetadata struct {
+	uri           string
+	normalizedURI string
+	contentType   string
+}
+
+// CreateWriter creates a bounded-memory, append-only package writer.
+// The caller retains ownership of writer.
+func (p *Packaging) CreateWriter(writer io.Writer) (*PackageWriter, error) {
+	if writer == nil {
+		return nil, errors.New("writer must not be nil")
+	}
+
+	result := &PackageWriter{
+		archiveWriter: zip.NewWriter(writer),
+		base:          newPackageBase("", nil),
+		parts:         make(map[string]*writerPartMetadata),
+		handles:       make(map[*Part]*writerPartMetadata),
+	}
+
+	originURI, _ := url.Parse("/aasx/aasx-origin")
+	origin, err := result.putPartFromStreamLocked(
+		originURI,
+		"text/plain",
+		strings.NewReader("Intentionally empty."),
+	)
+	if err != nil {
+		closeErr := result.archiveWriter.Close()
+		return nil, combineErrors(err, closeErr)
+	}
+	originMetadata, err := result.validatePartLocked(origin)
+	Ensure(err == nil, "The origin handle must belong to the package writer.")
+	result.base.originURI = originMetadata.normalizedURI
+	result.base.addRelationship("", originMetadata.uri, RelationTypeAasxOrigin)
+	return result, nil
+}
+
+// PutPartFromStream writes one complete part before returning. A failed input
+// or output poisons the writer because an append-only ZIP can not roll back it.
+func (writer *PackageWriter) PutPartFromStream(
+	uri *url.URL,
+	contentType string,
+	stream io.Reader,
+) (*Part, error) {
+	if writer == nil {
+		return nil, ErrWriterClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if err := writer.stateErrorLocked(); err != nil {
+		return nil, err
+	}
+	if stream == nil {
+		return nil, errors.New("part stream must not be nil")
+	}
+	return writer.putPartFromStreamLocked(uri, contentType, stream)
+}
+
+func (writer *PackageWriter) putPartFromStreamLocked(
+	uri *url.URL,
+	contentType string,
+	stream io.Reader,
+) (*Part, error) {
+	partURI, normalizedURI, zipPath, err := writer.validateNewPartLocked(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	entry, err := writer.archiveWriter.Create(zipPath)
+	if err != nil {
+		return nil, writer.failLocked(fmt.Errorf("failed to create part %s: %w", zipPath, err))
+	}
+	buffer := make([]byte, streamCopyBufferSize)
+	if _, err := io.CopyBuffer(entry, struct{ io.Reader }{stream}, buffer); err != nil {
+		return nil, writer.failLocked(fmt.Errorf("failed to copy part %s: %w", zipPath, err))
+	}
+
+	part := &Part{
+		URI:         partURI,
+		ContentType: contentType,
+		writeOnly:   true,
+	}
+	metadata := &writerPartMetadata{
+		uri:           partURI.String(),
+		normalizedURI: normalizedURI,
+		contentType:   contentType,
+	}
+	writer.parts[normalizedURI] = metadata
+	writer.handles[part] = metadata
+	return part, nil
+}
+
+func (writer *PackageWriter) validateNewPartLocked(
+	uri *url.URL,
+) (*url.URL, string, string, error) {
+	if uri == nil || uri.Path == "" {
+		return nil, "", "", errors.New("part URI must not be empty")
+	}
+	if uri.Scheme != "" || uri.Host != "" || uri.RawQuery != "" || uri.Fragment != "" {
+		return nil, "", "", fmt.Errorf("part URI must be an internal path: %s", uri.String())
+	}
+
+	partPath := normalizePathForURI(uri.Path)
+	zipPath := strings.TrimPrefix(partPath, "/")
+	if partPath == "/" || strings.HasSuffix(uri.Path, "/") {
+		return nil, "", "", fmt.Errorf("part URI must identify a file: %s", uri.String())
+	}
+	if isReservedOPCPath(zipPath) {
+		return nil, "", "", fmt.Errorf("part URI is reserved for OPC metadata: %s", partPath)
+	}
+
+	partURI, err := url.Parse(partPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("invalid part URI %s: %w", partPath, err)
+	}
+	normalizedURI := normalizeURI(partURI)
+	if _, exists := writer.parts[normalizedURI]; exists {
+		return nil, "", "", fmt.Errorf("part already exists: %s", partPath)
+	}
+	return partURI, normalizedURI, zipPath, nil
+}
+
+// MakeSpec relates part to the AASX origin as a specification part.
+func (writer *PackageWriter) MakeSpec(part *Part) error {
+	if writer == nil {
+		return ErrWriterClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if err := writer.stateErrorLocked(); err != nil {
+		return err
+	}
+	stored, err := writer.validatePartLocked(part)
+	if err != nil {
+		return err
+	}
+	if !writer.base.hasRelationship(
+		writer.base.originURI, stored.uri, RelationTypeAasxSpec) {
+		writer.base.addRelationship(
+			writer.base.originURI, stored.uri, RelationTypeAasxSpec)
+	}
+	return nil
+}
+
+// RelateSupplementaryToSpec creates a supplementary relationship. Its argument
+// order matches PackageReadWrite: supplementary first, specification second.
+func (writer *PackageWriter) RelateSupplementaryToSpec(
+	supplementary *Part,
+	spec *Part,
+) error {
+	if writer == nil {
+		return ErrWriterClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if err := writer.stateErrorLocked(); err != nil {
+		return err
+	}
+	storedSupplementary, err := writer.validatePartLocked(supplementary)
+	if err != nil {
+		return err
+	}
+	storedSpec, err := writer.validatePartLocked(spec)
+	if err != nil {
+		return err
+	}
+	if !writer.base.hasRelationship(
+		writer.base.originURI, storedSpec.uri, RelationTypeAasxSpec) {
+		return fmt.Errorf("part is not a specification: %s", storedSpec.uri)
+	}
+	if !writer.base.hasRelationship(
+		storedSpec.uri,
+		storedSupplementary.uri,
+		RelationTypeAasxSupplementary,
+	) {
+		writer.base.addRelationship(
+			storedSpec.uri,
+			storedSupplementary.uri,
+			RelationTypeAasxSupplementary,
+		)
+	}
+	return nil
+}
+
+// SetThumbnail sets part as the package thumbnail.
+func (writer *PackageWriter) SetThumbnail(part *Part) error {
+	if writer == nil {
+		return ErrWriterClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if err := writer.stateErrorLocked(); err != nil {
+		return err
+	}
+	stored, err := writer.validatePartLocked(part)
+	if err != nil {
+		return err
+	}
+	for _, rel := range writer.base.getRelationshipsByType("", RelationTypeThumbnail) {
+		writer.base.removeRelationship("", rel.target, RelationTypeThumbnail)
+	}
+	writer.base.addRelationship("", stored.uri, RelationTypeThumbnail)
+	return nil
+}
+
+func (writer *PackageWriter) validatePartLocked(part *Part) (*writerPartMetadata, error) {
+	if part == nil || !part.writeOnly {
+		return nil, errors.New("part does not belong to this package writer")
+	}
+	stored, exists := writer.handles[part]
+	if !exists {
+		return nil, errors.New("part does not belong to this package writer")
+	}
+	return stored, nil
+}
+
+func (writer *PackageWriter) stateErrorLocked() error {
+	if writer.closed {
+		return ErrWriterClosed
+	}
+	return writer.failure
+}
+
+func (writer *PackageWriter) failLocked(err error) error {
+	if writer.failure == nil {
+		writer.failure = err
+	}
+	return writer.failure
+}
+
+// Close writes OPC metadata and finalizes the ZIP exactly once. It does not
+// close the caller-owned destination.
+func (writer *PackageWriter) Close() error {
+	if writer == nil {
+		return ErrWriterClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if writer.closed {
+		return writer.closeErr
+	}
+	writer.closed = true
+
+	result := writer.failure
+	if result == nil {
+		result = writer.writeMetadataLocked()
+	}
+	result = combineErrors(result, writer.archiveWriter.Close())
+	writer.closeErr = result
+	return result
+}
+
+func (writer *PackageWriter) writeMetadataLocked() error {
+	parts := make([]contentTypePart, 0, len(writer.parts))
+	for _, part := range writer.parts {
+		parts = append(parts, contentTypePart{path: part.uri, contentType: part.contentType})
+	}
+	contentTypes := buildContentTypesForParts(parts)
+	if err := writer.writeXMLEntryLocked("[Content_Types].xml", contentTypes); err != nil {
+		return fmt.Errorf("failed to write content types: %w", err)
+	}
+
+	sourcePaths := make([]string, 0, len(writer.base.relationships))
+	for sourcePath, relationships := range writer.base.relationships {
+		if len(relationships) != 0 {
+			sourcePaths = append(sourcePaths, sourcePath)
+		}
+	}
+	sort.Strings(sourcePaths)
+	for _, sourcePath := range sourcePaths {
+		rels := relationshipsXML{Xmlns: opcRelationshipNamespace}
+		for _, rel := range writer.base.relationships[sourcePath] {
+			rels.Relationships = append(rels.Relationships, relationshipXML{
+				ID:         rel.id,
+				Type:       rel.relType,
+				Target:     rel.target,
+				TargetMode: rel.targetMode,
+			})
+		}
+		entryPath := strings.TrimPrefix(getRelsPath(sourcePath), "/")
+		if err := writer.writeXMLEntryLocked(entryPath, rels); err != nil {
+			return fmt.Errorf("failed to write relationships %s: %w", entryPath, err)
+		}
+	}
+	return nil
+}
+
+func (writer *PackageWriter) writeXMLEntryLocked(name string, value interface{}) error {
+	entry, err := writer.archiveWriter.Create(name)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(entry, xml.Header); err != nil {
+		return err
+	}
+	encoder := xml.NewEncoder(entry)
+	encoder.Indent("", "  ")
+	if err := encoder.Encode(value); err != nil {
+		return err
+	}
+	return encoder.Flush()
+}
+
+func combineErrors(primary error, additional error) error {
+	if primary == nil {
+		return additional
+	}
+	if additional == nil {
+		return primary
+	}
+	return fmt.Errorf("%w; additionally: %v", primary, additional)
 }
 
 // endregion
@@ -780,8 +1490,11 @@ func (p *PackageReadWrite) PutPart(
 	contentType string,
 	content []byte,
 ) (*Part, error) {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer base.mu.Unlock()
 
 	normalizedURI := normalizeURI(uri)
 
@@ -793,12 +1506,12 @@ func (p *PackageReadWrite) PutPart(
 		URI:         uri,
 		ContentType: contentType,
 		content:     contentCopy,
-		pkg:         p.base,
+		pkg:         base,
 	}
 
-	p.base.parts[normalizedURI] = part
+	base.parts[normalizedURI] = part
 
-	stored := p.base.parts[normalizedURI]
+	stored := base.parts[normalizedURI]
 	Ensure(stored != nil, "The part should be included in the package.")
 	if stored != nil {
 		Ensure(
@@ -815,6 +1528,12 @@ func (p *PackageReadWrite) PutPartFromStream(
 	contentType string,
 	stream io.Reader,
 ) (*Part, error) {
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return nil, err
+	}
+	base.mu.RUnlock()
+
 	content, err := io.ReadAll(stream)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read stream: %w", err)
@@ -824,13 +1543,16 @@ func (p *PackageReadWrite) PutPartFromStream(
 
 // DeletePart removes a part from the package.
 func (p *PackageReadWrite) DeletePart(part *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
 	normalizedURI := normalizeURI(part.URI)
-	delete(p.base.parts, normalizedURI)
+	delete(base.parts, normalizedURI)
 
-	_, exists := p.base.parts[normalizedURI]
+	_, exists := base.parts[normalizedURI]
 	Ensure(!exists, "The part should not exist in the package anymore.")
 
 	return nil
@@ -838,56 +1560,62 @@ func (p *PackageReadWrite) DeletePart(part *Part) error {
 
 // MakeSpec relates the given part to the origin as a spec.
 func (p *PackageReadWrite) MakeSpec(part *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
 	// Check if relationship already exists
-	if p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec) {
+	if base.hasRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec) {
 		return nil
 	}
 
-	p.base.addRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	base.addRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec)
 
-	listed := p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	listed := base.hasRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec)
 	if listed {
-		_, exists := p.base.parts[normalizeURI(part.URI)]
+		_, exists := base.parts[normalizeURI(part.URI)]
 		listed = exists
 	}
 	Ensure(listed, "Spec must be listed.")
 
-	isSpec := p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	isSpec := base.hasRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec)
 	Ensure(isSpec, "The part fulfills the spec property.")
 	return nil
 }
 
 // UnmakeSpec removes the spec relationship for the given part.
 func (p *PackageReadWrite) UnmakeSpec(part *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
-	isSpec := p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	isSpec := base.hasRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec)
 	Require(isSpec, "The part fulfills the spec property.")
 
 	oldSpecURISet := make(map[string]struct{})
-	for _, rel := range p.base.getRelationshipsByType(
-		p.base.originURI,
+	for _, rel := range base.getRelationshipsByType(
+		base.originURI,
 		RelationTypeAasxSpec,
 	) {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if _, ok := p.base.parts[normalizedTarget]; ok {
+		if _, ok := base.parts[normalizedTarget]; ok {
 			oldSpecURISet[normalizedTarget] = struct{}{}
 		}
 	}
 
-	p.base.removeRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	base.removeRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec)
 
 	newSpecURISet := make(map[string]struct{})
-	for _, rel := range p.base.getRelationshipsByType(
-		p.base.originURI,
+	for _, rel := range base.getRelationshipsByType(
+		base.originURI,
 		RelationTypeAasxSpec,
 	) {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if _, ok := p.base.parts[normalizedTarget]; ok {
+		if _, ok := base.parts[normalizedTarget]; ok {
 			newSpecURISet[normalizedTarget] = struct{}{}
 		}
 	}
@@ -917,14 +1645,17 @@ func (p *PackageReadWrite) UnmakeSpec(part *Part) error {
 func (p *PackageReadWrite) RelateSupplementaryToSpec(
 	supplementary *Part,
 	spec *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
-	isSpec := p.base.hasRelationship(p.base.originURI, spec.URI.String(), RelationTypeAasxSpec)
+	isSpec := base.hasRelationship(base.originURI, spec.URI.String(), RelationTypeAasxSpec)
 	Require(isSpec, "The part fulfills the spec property.")
 
 	// Check if relationship already exists
-	if p.base.hasRelationship(
+	if base.hasRelationship(
 		spec.URI.String(),
 		supplementary.URI.String(),
 		RelationTypeAasxSupplementary,
@@ -932,17 +1663,17 @@ func (p *PackageReadWrite) RelateSupplementaryToSpec(
 		return nil
 	}
 
-	p.base.addRelationship(
+	base.addRelationship(
 		spec.URI.String(),
 		supplementary.URI.String(),
 		RelationTypeAasxSupplementary)
 
-	relExists := p.base.hasRelationship(
+	relExists := base.hasRelationship(
 		spec.URI.String(),
 		supplementary.URI.String(),
 		RelationTypeAasxSupplementary)
 	if relExists {
-		_, exists := p.base.parts[normalizeURI(supplementary.URI)]
+		_, exists := base.parts[normalizeURI(supplementary.URI)]
 		relExists = exists
 	}
 	Ensure(relExists, "The supplementary must be listed.")
@@ -951,35 +1682,38 @@ func (p *PackageReadWrite) RelateSupplementaryToSpec(
 
 // UnrelateSupplementaryFromSpec removes the supplementary relationship.
 func (p *PackageReadWrite) UnrelateSupplementaryFromSpec(supplementary *Part, spec *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
-	isSpec := p.base.hasRelationship(p.base.originURI, spec.URI.String(), RelationTypeAasxSpec)
+	isSpec := base.hasRelationship(base.originURI, spec.URI.String(), RelationTypeAasxSpec)
 	Require(isSpec, "The part fulfills the spec property.")
 
 	oldSupplURISet := make(map[string]struct{})
-	for _, rel := range p.base.getRelationshipsByType(
+	for _, rel := range base.getRelationshipsByType(
 		spec.URI.String(),
 		RelationTypeAasxSupplementary,
 	) {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if _, ok := p.base.parts[normalizedTarget]; ok {
+		if _, ok := base.parts[normalizedTarget]; ok {
 			oldSupplURISet[normalizedTarget] = struct{}{}
 		}
 	}
 
-	p.base.removeRelationship(
+	base.removeRelationship(
 		spec.URI.String(),
 		supplementary.URI.String(),
 		RelationTypeAasxSupplementary)
 
 	newSupplURISet := make(map[string]struct{})
-	for _, rel := range p.base.getRelationshipsByType(
+	for _, rel := range base.getRelationshipsByType(
 		spec.URI.String(),
 		RelationTypeAasxSupplementary,
 	) {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if _, ok := p.base.parts[normalizedTarget]; ok {
+		if _, ok := base.parts[normalizedTarget]; ok {
 			newSupplURISet[normalizedTarget] = struct{}{}
 		}
 	}
@@ -1010,23 +1744,26 @@ func (p *PackageReadWrite) UnrelateSupplementaryFromSpec(supplementary *Part, sp
 
 // SetThumbnail sets the thumbnail of the package.
 func (p *PackageReadWrite) SetThumbnail(part *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
 	// First remove any existing thumbnail relationship
-	rels := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	rels := base.getRelationshipsByType("", RelationTypeThumbnail)
 	for _, rel := range rels {
-		p.base.removeRelationship("", rel.target, RelationTypeThumbnail)
+		base.removeRelationship("", rel.target, RelationTypeThumbnail)
 	}
 
 	// Add new thumbnail relationship
-	p.base.addRelationship("", part.URI.String(), RelationTypeThumbnail)
+	base.addRelationship("", part.URI.String(), RelationTypeThumbnail)
 
-	thumbnailRels := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	thumbnailRels := base.getRelationshipsByType("", RelationTypeThumbnail)
 	Ensure(len(thumbnailRels) > 0, "The thumbnail must be available.")
 	if len(thumbnailRels) > 0 {
 		normalizedTarget := normalizePathForMap(thumbnailRels[0].target)
-		stored, exists := p.base.parts[normalizedTarget]
+		stored, exists := base.parts[normalizedTarget]
 		Ensure(exists, "The thumbnail must point to the part.")
 		if exists {
 			Ensure(
@@ -1039,23 +1776,29 @@ func (p *PackageReadWrite) SetThumbnail(part *Part) error {
 
 // UnsetThumbnail removes the thumbnail from the package.
 func (p *PackageReadWrite) UnsetThumbnail() error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
-	rels := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	rels := base.getRelationshipsByType("", RelationTypeThumbnail)
 	for _, rel := range rels {
-		p.base.removeRelationship("", rel.target, RelationTypeThumbnail)
+		base.removeRelationship("", rel.target, RelationTypeThumbnail)
 	}
 
-	remaining := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	remaining := base.getRelationshipsByType("", RelationTypeThumbnail)
 	Ensure(len(remaining) == 0, "The thumbnail must not exist any more")
 	return nil
 }
 
 // Flush writes all pending changes to the underlying stream or file.
 func (p *PackageReadWrite) Flush() error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
 	// Create the zip content in memory
 	var buf bytes.Buffer
@@ -1068,11 +1811,11 @@ func (p *PackageReadWrite) Flush() error {
 		if err := os.WriteFile(p.Path, buf.Bytes(), 0644); err != nil {
 			return fmt.Errorf("failed to write file: %w", err)
 		}
-	} else if p.base.stream != nil {
-		if _, err := p.base.stream.Seek(0, io.SeekStart); err != nil {
+	} else if base.stream != nil {
+		if _, err := base.stream.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("failed to seek stream: %w", err)
 		}
-		if _, err := p.base.stream.Write(buf.Bytes()); err != nil {
+		if _, err := base.stream.Write(buf.Bytes()); err != nil {
 			return fmt.Errorf("failed to write stream: %w", err)
 		}
 	}
@@ -1159,6 +1902,34 @@ func (p *PackageReadWrite) writeToZip(w io.Writer) error {
 
 // buildContentTypes builds the content types XML structure
 func (p *PackageReadWrite) buildContentTypes() contentTypesXML {
+	return buildContentTypes(p.base.parts)
+}
+
+type contentTypePart struct {
+	path        string
+	contentType string
+}
+
+func buildContentTypes(parts map[string]*Part) contentTypesXML {
+	contentTypeParts := make([]contentTypePart, 0, len(parts))
+	for _, part := range parts {
+		contentTypeParts = append(contentTypeParts, contentTypePart{
+			path:        part.URI.String(),
+			contentType: part.ContentType,
+		})
+	}
+	return buildContentTypesForParts(contentTypeParts)
+}
+
+func buildContentTypesForParts(parts []contentTypePart) contentTypesXML {
+	parts = append([]contentTypePart(nil), parts...)
+	sort.Slice(parts, func(i, j int) bool {
+		if parts[i].path == parts[j].path {
+			return parts[i].contentType < parts[j].contentType
+		}
+		return parts[i].path < parts[j].path
+	})
+
 	ct := contentTypesXML{
 		Xmlns: opcContentTypesNamespace,
 	}
@@ -1173,22 +1944,22 @@ func (p *PackageReadWrite) buildContentTypes() contentTypesXML {
 	extMap := make(map[string]string)
 	overrides := make(map[string]string)
 
-	for _, part := range p.base.parts {
-		partPath := part.URI.String()
+	for _, part := range parts {
+		partPath := part.path
 		ext := strings.TrimPrefix(filepath.Ext(partPath), ".")
 		ext = strings.ToLower(ext)
 
 		if ext == "" {
 			// No extension, need override
-			overrides[partPath] = part.ContentType
+			overrides[partPath] = part.contentType
 		} else {
 			if existingCT, ok := extMap[ext]; ok {
 				// Extension already seen with different content type - need override
-				if existingCT != part.ContentType {
-					overrides[partPath] = part.ContentType
+				if existingCT != part.contentType {
+					overrides[partPath] = part.contentType
 				}
 			} else {
-				extMap[ext] = part.ContentType
+				extMap[ext] = part.contentType
 			}
 		}
 	}
@@ -1225,6 +1996,48 @@ func (p *PackageReadWrite) buildContentTypes() contentTypesXML {
 // endregion
 
 // region Helper Functions
+
+func isZIPDirectory(file *zip.File) bool {
+	return file.FileInfo().IsDir() || strings.HasSuffix(strings.ReplaceAll(file.Name, "\\", "/"), "/")
+}
+
+func isContentTypesPath(zipPath string) bool {
+	return normalizePathForMap(zipPath) == normalizePathForMap("/[Content_Types].xml")
+}
+
+func isRelationshipPartPath(zipPath string) bool {
+	normalized := strings.TrimPrefix(normalizePathForURI(zipPath), "/")
+	directory := pathpkg.Dir(normalized)
+	base := pathpkg.Base(normalized)
+	if pathpkg.Base(directory) != "_rels" || !strings.HasSuffix(base, ".rels") {
+		return false
+	}
+	return base != ".rels" || directory == "_rels"
+}
+
+func isReservedOPCPath(zipPath string) bool {
+	if isContentTypesPath(zipPath) {
+		return true
+	}
+	normalized := strings.TrimPrefix(normalizePathForMap(zipPath), "/")
+	for _, segment := range strings.Split(normalized, "/") {
+		if segment == "_rels" {
+			return true
+		}
+	}
+	return false
+}
+
+func isOPCMetadataPath(zipPath string) bool {
+	return isContentTypesPath(zipPath) || isRelationshipPartPath(zipPath)
+}
+
+func checkedExpandedTotal(total uint64, size uint64) (uint64, error) {
+	if total > ^uint64(0)-size {
+		return 0, fmt.Errorf("%w: total expanded size overflows uint64", ErrReaderLimitExceeded)
+	}
+	return total + size, nil
+}
 
 // normalizeURI returns a normalized string representation of a URI for use as map key
 func normalizeURI(uri *url.URL) string {

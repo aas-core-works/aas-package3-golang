@@ -18,8 +18,10 @@ The `Packaging` instance provides the following methods:
 |--------|-------------|
 | `Create(path)` | Create a new AASX package at the given file path |
 | `CreateInStream(stream)` | Create a new AASX package in a stream |
-| `OpenRead(path)` | Open an existing AASX package for reading |
-| `OpenReadFromStream(stream)` | Open an AASX package from a stream for reading |
+| `CreateWriter(writer)` | Create a bounded-memory, append-only package on an `io.Writer` |
+| `OpenRead(path, options...)` | Lazily open an existing AASX package for reading |
+| `OpenReadFromStream(stream, options...)` | Lazily open from an `io.ReadSeeker` |
+| `OpenReadFromReaderAt(reader, size, options...)` | Lazily open from an `io.ReaderAt` |
 | `OpenReadWrite(path)` | Open an existing AASX package for read/write |
 | `OpenReadWriteFromStream(stream)` | Open an AASX package from a stream for read/write |
 
