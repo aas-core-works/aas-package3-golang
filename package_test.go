@@ -4,10 +4,13 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/xml"
+	"errors"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -35,6 +38,90 @@ func mustParseURL(rawURL string) *url.URL {
 		panic(err)
 	}
 	return u
+}
+
+type byteRange struct {
+	start int64
+	end   int64
+}
+
+type failingRangeReaderAt struct {
+	reader  *bytes.Reader
+	blocked byteRange
+	err     error
+}
+
+func (reader *failingRangeReaderAt) ReadAt(buffer []byte, offset int64) (int, error) {
+	end := offset + int64(len(buffer))
+	if offset < reader.blocked.end && end > reader.blocked.start {
+		return 0, reader.err
+	}
+	return reader.reader.ReadAt(buffer, offset)
+}
+
+type closeTrackingReaderAt struct {
+	*bytes.Reader
+	closed bool
+}
+
+func (reader *closeTrackingReaderAt) Close() error {
+	reader.closed = true
+	return nil
+}
+
+func lazyTestPackage(t *testing.T) ([]byte, map[string]byteRange) {
+	t.Helper()
+
+	var output bytes.Buffer
+	writer := zip.NewWriter(&output)
+	ranges := make(map[string]byteRange)
+
+	writeEntry := func(name string, content []byte) {
+		t.Helper()
+		header := &zip.FileHeader{Name: name, Method: zip.Store}
+		entry, err := writer.CreateHeader(header)
+		if err != nil {
+			t.Fatalf("Failed to create %s: %v", name, err)
+		}
+		if _, err := entry.Write(content); err != nil {
+			t.Fatalf("Failed to write %s: %v", name, err)
+		}
+	}
+
+	writeEntry("aasx/aasx-origin", []byte("Intentionally empty."))
+	writeEntry("aasx/spec.bin", bytes.Repeat([]byte{0x11}, 128*1024))
+	writeEntry("aasx/other.bin", bytes.Repeat([]byte{0x22}, 128*1024))
+	// Keep the central-directory search window away from the parts asserted in
+	// the lazy-read tests.
+	writeEntry("aasx/padding.bin", bytes.Repeat([]byte{0x33}, 128*1024))
+	writeEntry("[Content_Types].xml", []byte(xml.Header+`<Types xmlns="`+
+		opcContentTypesNamespace+`"><Default Extension="bin" ContentType="application/octet-stream"/>`+
+		`<Override PartName="/aasx/aasx-origin" ContentType="text/plain"/></Types>`))
+	writeEntry("_rels/.rels", []byte(xml.Header+`<Relationships xmlns="`+
+		opcRelationshipNamespace+`"><Relationship Id="R1" Type="`+RelationTypeAasxOrigin+
+		`" Target="/aasx/aasx-origin"/></Relationships>`))
+	writeEntry("aasx/_rels/aasx-origin.rels", []byte(xml.Header+`<Relationships xmlns="`+
+		opcRelationshipNamespace+`"><Relationship Id="R2" Type="`+RelationTypeAasxSpec+
+		`" Target="/aasx/spec.bin"/></Relationships>`))
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close test ZIP: %v", err)
+	}
+	archive, err := zip.NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatalf("Failed to inspect test ZIP: %v", err)
+	}
+	for _, file := range archive.File {
+		offset, err := file.DataOffset()
+		if err != nil {
+			t.Fatalf("Failed to find data offset for %s: %v", file.Name, err)
+		}
+		ranges[file.Name] = byteRange{
+			start: offset,
+			end:   offset + int64(file.CompressedSize64),
+		}
+	}
+	return output.Bytes(), ranges
 }
 
 func relationshipTypesInZip(t *testing.T, zipData []byte) []string {
@@ -237,6 +324,217 @@ func rewriteRelationshipTargetsInZip(
 	}
 
 	return out.Bytes()
+}
+
+// =============================================================================
+// TestPackageRead - Lazy and bounded reading
+// =============================================================================
+
+func TestOpenReadFromReaderAtReadsPartsLazily(t *testing.T) {
+	data, ranges := lazyTestPackage(t)
+	blockedErr := errors.New("payload range read")
+	packaging := NewPackaging()
+
+	reader := &failingRangeReaderAt{
+		reader:  bytes.NewReader(data),
+		blocked: ranges["aasx/spec.bin"],
+		err:     blockedErr,
+	}
+	pkg, err := packaging.OpenReadFromReaderAt(reader, int64(len(data)))
+	if err != nil {
+		t.Fatalf("Opening package unexpectedly read the spec payload: %v", err)
+	}
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	if _, err := specs[0].ReadAllBytes(); !errors.Is(err, blockedErr) {
+		t.Fatalf("Expected deferred payload error, got: %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+
+	reader = &failingRangeReaderAt{
+		reader:  bytes.NewReader(data),
+		blocked: ranges["aasx/other.bin"],
+		err:     blockedErr,
+	}
+	pkg, err = packaging.OpenReadFromReaderAt(reader, int64(len(data)))
+	if err != nil {
+		t.Fatalf("Opening package unexpectedly read an unrelated payload: %v", err)
+	}
+	defer pkg.Close()
+	specs, err = pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	content, err := specs[0].ReadAllBytes()
+	if err != nil {
+		t.Fatalf("Reading spec unexpectedly read another part: %v", err)
+	}
+	if len(content) != 128*1024 {
+		t.Fatalf("Expected 128 KiB spec, got %d bytes", len(content))
+	}
+}
+
+func TestLazyReaderLimits(t *testing.T) {
+	data, _ := lazyTestPackage(t)
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to inspect test package: %v", err)
+	}
+
+	var partCount uint64
+	var metadataBytes uint64
+	var largestPart uint64
+	var totalExpanded uint64
+	for _, file := range reader.File {
+		if strings.HasSuffix(file.Name, "/") {
+			continue
+		}
+		partCount++
+		if isOPCMetadataPath(file.Name) {
+			metadataBytes += file.UncompressedSize64
+			continue
+		}
+		if file.UncompressedSize64 > largestPart {
+			largestPart = file.UncompressedSize64
+		}
+		totalExpanded += file.UncompressedSize64
+	}
+
+	packaging := NewPackaging()
+	open := func(options ...ReaderOption) error {
+		pkg, openErr := packaging.OpenReadFromReaderAt(
+			bytes.NewReader(data), int64(len(data)), options...)
+		if openErr == nil {
+			openErr = pkg.Close()
+		}
+		return openErr
+	}
+
+	if err := open(
+		WithMaxPartCount(partCount),
+		WithMaxOPCMetadataBytes(metadataBytes),
+		WithMaxPartExpandedBytes(largestPart),
+		WithMaxTotalExpandedBytes(totalExpanded),
+	); err != nil {
+		t.Fatalf("Exact reader limits should be accepted: %v", err)
+	}
+
+	limits := []ReaderOption{
+		WithMaxPartCount(partCount - 1),
+		WithMaxOPCMetadataBytes(metadataBytes - 1),
+		WithMaxPartExpandedBytes(largestPart - 1),
+		WithMaxTotalExpandedBytes(totalExpanded - 1),
+	}
+	for index, option := range limits {
+		if err := open(option); !errors.Is(err, ErrReaderLimitExceeded) {
+			t.Errorf("Limit %d: expected ErrReaderLimitExceeded, got %v", index, err)
+		}
+	}
+
+	if err := open(
+		WithMaxPartCount(0),
+		WithMaxOPCMetadataBytes(0),
+		WithMaxPartExpandedBytes(0),
+		WithMaxTotalExpandedBytes(0),
+	); err != nil {
+		t.Fatalf("Zero limits should be unlimited: %v", err)
+	}
+}
+
+func TestLazyReaderOwnershipAndClose(t *testing.T) {
+	data, _ := lazyTestPackage(t)
+	packaging := NewPackaging()
+
+	external := &closeTrackingReaderAt{Reader: bytes.NewReader(data)}
+	pkg, err := packaging.OpenReadFromReaderAt(external, int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to open external reader: %v", err)
+	}
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+	if external.closed {
+		t.Fatal("Package closed a caller-owned ReaderAt")
+	}
+	if _, err := specs[0].ReadAllBytes(); !errors.Is(err, ErrPackageClosed) {
+		t.Fatalf("Expected ErrPackageClosed, got %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Repeated Close failed: %v", err)
+	}
+
+	tmpdir, cleanup := temporaryDirectory(t)
+	defer cleanup()
+	path := filepath.Join(tmpdir, "lazy.aasx")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("Failed to write test package: %v", err)
+	}
+	pkg, err = packaging.OpenRead(path)
+	if err != nil {
+		t.Fatalf("Failed to open file package: %v", err)
+	}
+	ownedFile, ok := pkg.base.ownedCloser.(*os.File)
+	if !ok {
+		t.Fatal("OpenRead did not retain an owned file")
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close file package: %v", err)
+	}
+	if _, err := ownedFile.Stat(); err == nil {
+		t.Fatal("OpenRead-owned file remains open after Close")
+	}
+}
+
+func TestOpenReadFromStreamSupportsConcurrentPartReads(t *testing.T) {
+	data, _ := lazyTestPackage(t)
+	pkg, err := NewPackaging().OpenReadFromStream(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Failed to open stream: %v", err)
+	}
+	defer pkg.Close()
+
+	parts := make([]*Part, 0, 2)
+	for _, rawURI := range []string{"/aasx/spec.bin", "/aasx/other.bin"} {
+		part, err := pkg.MustPart(mustParseURL(rawURI))
+		if err != nil {
+			t.Fatalf("Failed to get %s: %v", rawURI, err)
+		}
+		parts = append(parts, part)
+	}
+
+	var group sync.WaitGroup
+	errorsByRead := make(chan error, 20)
+	for _, part := range parts {
+		part := part
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for index := 0; index < 10; index++ {
+				content, readErr := part.ReadAllBytes()
+				if readErr != nil {
+					errorsByRead <- readErr
+					return
+				}
+				if len(content) != 128*1024 {
+					errorsByRead <- errors.New("unexpected part size")
+					return
+				}
+			}
+		}()
+	}
+	group.Wait()
+	close(errorsByRead)
+	for readErr := range errorsByRead {
+		t.Errorf("Concurrent read failed: %v", readErr)
+	}
 }
 
 // =============================================================================

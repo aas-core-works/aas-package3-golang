@@ -40,9 +40,13 @@ const (
 
 // Common errors
 var (
-	ErrNoOriginPart  = errors.New("no origin part found")
-	ErrPartNotFound  = errors.New("part not found")
-	ErrInvalidFormat = errors.New("invalid package format")
+	ErrNoOriginPart        = errors.New("no origin part found")
+	ErrPartNotFound        = errors.New("part not found")
+	ErrInvalidFormat       = errors.New("invalid package format")
+	ErrReaderLimitExceeded = errors.New("reader limit exceeded")
+	ErrPackageClosed       = errors.New("package is closed")
+	ErrWriterClosed        = errors.New("package writer is closed")
+	ErrWriteOnlyPart       = errors.New("part belongs to a write-only package")
 )
 
 // region OPC XML Types
@@ -92,6 +96,176 @@ type relationship struct {
 
 // endregion
 
+// region Lazy Reader Options and Helpers
+
+const streamCopyBufferSize = 32 * 1024
+
+// ReaderOption configures the resource limits applied while opening and
+// reading a package. A limit of zero means unlimited.
+type ReaderOption func(*readerOptions)
+
+type readerOptions struct {
+	maxPartCount          uint64
+	maxOPCMetadataBytes   uint64
+	maxPartExpandedBytes  uint64
+	maxTotalExpandedBytes uint64
+}
+
+// WithMaxPartCount limits the number of non-directory ZIP entries.
+func WithMaxPartCount(max uint64) ReaderOption {
+	return func(options *readerOptions) {
+		options.maxPartCount = max
+	}
+}
+
+// WithMaxOPCMetadataBytes limits the combined expanded size of
+// [Content_Types].xml and relationship parts.
+func WithMaxOPCMetadataBytes(max uint64) ReaderOption {
+	return func(options *readerOptions) {
+		options.maxOPCMetadataBytes = max
+	}
+}
+
+// WithMaxPartExpandedBytes limits the expanded size of each payload part.
+func WithMaxPartExpandedBytes(max uint64) ReaderOption {
+	return func(options *readerOptions) {
+		options.maxPartExpandedBytes = max
+	}
+}
+
+// WithMaxTotalExpandedBytes limits the combined expanded size of all payload
+// parts. OPC metadata is governed by WithMaxOPCMetadataBytes instead.
+func WithMaxTotalExpandedBytes(max uint64) ReaderOption {
+	return func(options *readerOptions) {
+		options.maxTotalExpandedBytes = max
+	}
+}
+
+func applyReaderOptions(options []ReaderOption) readerOptions {
+	var result readerOptions
+	for _, option := range options {
+		if option != nil {
+			option(&result)
+		}
+	}
+	return result
+}
+
+// readSeekerAt adapts an io.ReadSeeker to io.ReaderAt. ZIP readers can issue
+// concurrent ReadAt calls, so seeking and reading must be one critical section.
+type readSeekerAt struct {
+	stream io.ReadSeeker
+	mu     sync.Mutex
+}
+
+func (reader *readSeekerAt) ReadAt(buffer []byte, offset int64) (int, error) {
+	if offset < 0 {
+		return 0, fmt.Errorf("negative read offset: %d", offset)
+	}
+
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+
+	if _, err := reader.stream.Seek(offset, io.SeekStart); err != nil {
+		return 0, err
+	}
+
+	read, err := io.ReadFull(reader.stream, buffer)
+	if err == io.ErrUnexpectedEOF {
+		err = io.EOF
+	}
+	return read, err
+}
+
+type boundedReadCloser struct {
+	stream    io.ReadCloser
+	remaining uint64
+	label     string
+}
+
+func (reader *boundedReadCloser) Read(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
+	}
+
+	if reader.remaining == 0 {
+		var probe [1]byte
+		read, err := reader.stream.Read(probe[:])
+		if read > 0 {
+			return 0, fmt.Errorf("%w: %s", ErrReaderLimitExceeded, reader.label)
+		}
+		return 0, err
+	}
+
+	if uint64(len(buffer)) > reader.remaining {
+		buffer = buffer[:int(reader.remaining)]
+	}
+	read, err := reader.stream.Read(buffer)
+	reader.remaining -= uint64(read)
+	return read, err
+}
+
+func (reader *boundedReadCloser) Close() error {
+	return reader.stream.Close()
+}
+
+func readZipFile(file zipFile, max uint64, limited bool, label string) ([]byte, error) {
+	if limited && file.uncompressedSize() > max {
+		return nil, fmt.Errorf(
+			"%w: %s is %d bytes, maximum is %d",
+			ErrReaderLimitExceeded,
+			label,
+			file.uncompressedSize(),
+			max,
+		)
+	}
+
+	stream, err := file.open()
+	if err != nil {
+		return nil, err
+	}
+	if limited {
+		stream = &boundedReadCloser{
+			stream:    stream,
+			remaining: max,
+			label:     label,
+		}
+	}
+
+	var result bytes.Buffer
+	buffer := make([]byte, streamCopyBufferSize)
+	_, readErr := io.CopyBuffer(&result, struct{ io.Reader }{stream}, buffer)
+	closeErr := stream.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return result.Bytes(), nil
+}
+
+// zipFile is the small portion of archive/zip.File used by the bounded reader
+// helper. Keeping it as an interface makes limit and close failures testable.
+type zipFile interface {
+	open() (io.ReadCloser, error)
+	uncompressedSize() uint64
+}
+
+type archiveZipFile struct {
+	file *zip.File
+}
+
+func (file archiveZipFile) open() (io.ReadCloser, error) {
+	return file.file.Open()
+}
+
+func (file archiveZipFile) uncompressedSize() uint64 {
+	return file.file.UncompressedSize64
+}
+
+// endregion
+
 // region Part
 
 // Part represents a part of an AAS package.
@@ -105,26 +279,73 @@ type Part struct {
 	// content holds the byte content of the part
 	content []byte
 
-	// pkg is a reference back to the package (for lazy loading if needed)
+	// archiveFile references the underlying ZIP entry for lazy read packages.
+	archiveFile *zip.File
+
+	// pkg is a reference back to the package.
 	pkg *packageBase
+
+	// writeOnly identifies lightweight handles returned by PackageWriter.
+	writeOnly bool
 }
 
 // Stream opens a read stream for the part content.
 // The caller is responsible for closing the returned ReadCloser.
 func (p *Part) Stream() (io.ReadCloser, error) {
+	if p == nil {
+		return nil, ErrPartNotFound
+	}
+	if p.writeOnly {
+		return nil, ErrWriteOnlyPart
+	}
+	if p.pkg != nil {
+		p.pkg.mu.RLock()
+		defer p.pkg.mu.RUnlock()
+		if p.pkg.closed {
+			return nil, ErrPackageClosed
+		}
+	}
+	if p.archiveFile != nil {
+		stream, err := p.archiveFile.Open()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open part %s: %w", p.URI.String(), err)
+		}
+		if p.pkg.readerOptions.maxPartExpandedBytes != 0 {
+			stream = &boundedReadCloser{
+				stream:    stream,
+				remaining: p.pkg.readerOptions.maxPartExpandedBytes,
+				label:     fmt.Sprintf("part %s exceeds the expanded-size limit", p.URI.String()),
+			}
+		}
+		return stream, nil
+	}
 	return io.NopCloser(bytes.NewReader(p.content)), nil
 }
 
 // ReadAllBytes reads the whole content of the part as bytes.
 func (p *Part) ReadAllBytes() ([]byte, error) {
-	result := make([]byte, len(p.content))
-	copy(result, p.content)
+	stream, err := p.Stream()
+	if err != nil {
+		return nil, err
+	}
+	result, readErr := io.ReadAll(stream)
+	closeErr := stream.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
 	return result, nil
 }
 
 // ReadAllText reads the content of the part as UTF-8 text.
 func (p *Part) ReadAllText() (string, error) {
-	return string(p.content), nil
+	content, err := p.ReadAllBytes()
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
 }
 
 // SupplementaryRelationship represents a relationship between a spec and its supplementary part.
@@ -246,60 +467,49 @@ func (p *Packaging) CreateInStream(stream io.ReadWriteSeeker) (*PackageReadWrite
 	return result, nil
 }
 
-// OpenRead opens an AAS package at the given path for reading.
-// Returns a PackageRead instance or an error.
-func (p *Packaging) OpenRead(path string) (*PackageRead, error) {
-	// Open and read the zip file
-	data, err := os.ReadFile(path)
+// OpenRead opens an AAS package at the given path for lazy reading.
+// The package owns the opened file and releases it in PackageRead.Close.
+func (p *Packaging) OpenRead(path string, options ...ReaderOption) (*PackageRead, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("failed to stat file: %w", err)
 	}
 
-	reader := bytes.NewReader(data)
-	pkg, err := p.openFromReader(reader, int64(len(data)), path)
+	result, err := p.openReadFromReaderAt(file, info.Size(), path, file, options)
 	if err != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			return nil, fmt.Errorf("%w; additionally failed to close file: %v", err, closeErr)
+		}
 		return nil, err
 	}
-	pkg.readWrite = false
-
-	result := &PackageRead{
-		Path: path,
-		base: pkg,
-	}
-
 	Ensure(result.Path == path, "The Path property of the package must match the input path.")
-
 	return result, nil
 }
 
 // OpenReadFromStream opens an AAS package from the given stream for reading.
 // Returns a PackageRead instance or an error.
-func (p *Packaging) OpenReadFromStream(stream io.ReadSeeker) (*PackageRead, error) {
+func (p *Packaging) OpenReadFromStream(
+	stream io.ReadSeeker,
+	options ...ReaderOption,
+) (*PackageRead, error) {
+	if stream == nil {
+		return nil, errors.New("stream must not be nil")
+	}
+
 	// Get the stream size
 	size, err := stream.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to seek stream: %w", err)
 	}
-	if _, err := stream.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("failed to reset stream: %w", err)
-	}
-
-	// Read all data into memory for zip.NewReader
-	data := make([]byte, size)
-	if _, err := io.ReadFull(stream, data); err != nil {
-		return nil, fmt.Errorf("failed to read stream: %w", err)
-	}
-
-	reader := bytes.NewReader(data)
-	pkg, err := p.openFromReader(reader, size, "")
+	result, err := p.openReadFromReaderAt(
+		&readSeekerAt{stream: stream}, size, "", nil, options)
 	if err != nil {
 		return nil, err
-	}
-	pkg.readWrite = false
-
-	result := &PackageRead{
-		Path: "",
-		base: pkg,
 	}
 
 	Ensure(
@@ -307,6 +517,39 @@ func (p *Packaging) OpenReadFromStream(stream io.ReadSeeker) (*PackageRead, erro
 		"The Path property of the package must be empty if reading from a stream.")
 
 	return result, nil
+}
+
+// OpenReadFromReaderAt opens an AAS package lazily from a random-access reader.
+// The caller retains ownership of reader and must keep it usable until Close.
+func (p *Packaging) OpenReadFromReaderAt(
+	reader io.ReaderAt,
+	size int64,
+	options ...ReaderOption,
+) (*PackageRead, error) {
+	return p.openReadFromReaderAt(reader, size, "", nil, options)
+}
+
+func (p *Packaging) openReadFromReaderAt(
+	reader io.ReaderAt,
+	size int64,
+	path string,
+	ownedCloser io.Closer,
+	options []ReaderOption,
+) (*PackageRead, error) {
+	if reader == nil {
+		return nil, errors.New("reader must not be nil")
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("reader size must not be negative: %d", size)
+	}
+
+	pkg, err := p.openPackage(reader, size, path, true, applyReaderOptions(options))
+	if err != nil {
+		return nil, err
+	}
+	pkg.readWrite = false
+	pkg.ownedCloser = ownedCloser
+	return &PackageRead{Path: path, base: pkg}, nil
 }
 
 // OpenReadWrite opens an AAS package at the given path for read/write.
@@ -379,11 +622,21 @@ func (p *Packaging) OpenReadWriteFromStream(
 	return result, nil
 }
 
-// openFromReader opens an OPC package from a reader
+// openFromReader materializes an OPC package for the mutable compatibility API.
 func (p *Packaging) openFromReader(
-	reader *bytes.Reader,
+	reader io.ReaderAt,
 	size int64,
 	path string,
+) (*packageBase, error) {
+	return p.openPackage(reader, size, path, false, readerOptions{})
+}
+
+func (p *Packaging) openPackage(
+	reader io.ReaderAt,
+	size int64,
+	path string,
+	lazy bool,
+	options readerOptions,
 ) (*packageBase, error) {
 	zipReader, err := zip.NewReader(reader, size)
 	if err != nil {
@@ -391,18 +644,75 @@ func (p *Packaging) openFromReader(
 	}
 
 	pkg := newPackageBase(path, nil)
+	pkg.archiveReader = zipReader
+	pkg.readerOptions = options
+
+	var partCount uint64
+	var totalExpanded uint64
+	for _, file := range zipReader.File {
+		if strings.HasSuffix(file.Name, "/") {
+			continue
+		}
+		partCount++
+		if options.maxPartCount != 0 && partCount > options.maxPartCount {
+			return nil, fmt.Errorf(
+				"%w: package has more than %d parts",
+				ErrReaderLimitExceeded,
+				options.maxPartCount,
+			)
+		}
+		if isOPCMetadataPath(file.Name) {
+			continue
+		}
+		if options.maxPartExpandedBytes != 0 &&
+			file.UncompressedSize64 > options.maxPartExpandedBytes {
+			return nil, fmt.Errorf(
+				"%w: part %s is %d bytes, maximum is %d",
+				ErrReaderLimitExceeded,
+				file.Name,
+				file.UncompressedSize64,
+				options.maxPartExpandedBytes,
+			)
+		}
+		if totalExpanded > ^uint64(0)-file.UncompressedSize64 {
+			return nil, fmt.Errorf("%w: total expanded size overflows uint64", ErrReaderLimitExceeded)
+		}
+		totalExpanded += file.UncompressedSize64
+		if options.maxTotalExpandedBytes != 0 &&
+			totalExpanded > options.maxTotalExpandedBytes {
+			return nil, fmt.Errorf(
+				"%w: total expanded size is more than %d bytes",
+				ErrReaderLimitExceeded,
+				options.maxTotalExpandedBytes,
+			)
+		}
+	}
+
+	var metadataBytes uint64
+	readMetadata := func(file *zip.File, label string) ([]byte, error) {
+		max := options.maxOPCMetadataBytes
+		remaining := uint64(0)
+		limited := max != 0
+		if limited {
+			if metadataBytes > max {
+				return nil, fmt.Errorf("%w: OPC metadata exceeds %d bytes", ErrReaderLimitExceeded, max)
+			}
+			remaining = max - metadataBytes
+		}
+		data, readErr := readZipFile(archiveZipFile{file: file}, remaining, limited, label)
+		if readErr != nil {
+			return nil, readErr
+		}
+		metadataBytes += uint64(len(data))
+		return data, nil
+	}
 
 	// Read [Content_Types].xml
 	contentTypes := make(map[string]string) // path -> contentType
 	defaultTypes := make(map[string]string) // extension -> contentType
 	for _, file := range zipReader.File {
 		if file.Name == "[Content_Types].xml" {
-			rc, err := file.Open()
-			if err != nil {
-				return nil, fmt.Errorf("failed to open content types: %w", err)
-			}
-			data, err := io.ReadAll(rc)
-			rc.Close()
+			data, err := readMetadata(file, "OPC content types")
 			if err != nil {
 				return nil, fmt.Errorf("failed to read content types: %w", err)
 			}
@@ -426,12 +736,7 @@ func (p *Packaging) openFromReader(
 	for _, file := range zipReader.File {
 		relsPath := strings.ReplaceAll(file.Name, "\\", "/")
 		if strings.Contains(relsPath, "_rels/") && strings.HasSuffix(relsPath, ".rels") {
-			rc, err := file.Open()
-			if err != nil {
-				return nil, fmt.Errorf("failed to open rels file %s: %w", file.Name, err)
-			}
-			data, err := io.ReadAll(rc)
-			rc.Close()
+			data, err := readMetadata(file, fmt.Sprintf("relationship part %s", file.Name))
 			if err != nil {
 				return nil, fmt.Errorf("failed to read rels file %s: %w", file.Name, err)
 			}
@@ -470,16 +775,6 @@ func (p *Packaging) openFromReader(
 			continue
 		}
 
-		rc, err := file.Open()
-		if err != nil {
-			return nil, fmt.Errorf("failed to open part %s: %w", file.Name, err)
-		}
-		data, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read part %s: %w", file.Name, err)
-		}
-
 		partPath := "/" + strings.TrimPrefix(zipPath, "/")
 		normalizedPath := normalizePathForMap(partPath)
 
@@ -497,12 +792,22 @@ func (p *Packaging) openFromReader(
 		}
 
 		partURI, _ := url.Parse(partPath)
-		pkg.parts[normalizedPath] = &Part{
+		part := &Part{
 			URI:         partURI,
 			ContentType: contentType,
-			content:     data,
 			pkg:         pkg,
 		}
+		if lazy {
+			part.archiveFile = file
+		} else {
+			data, readErr := readZipFile(
+				archiveZipFile{file: file}, 0, false, fmt.Sprintf("part %s", file.Name))
+			if readErr != nil {
+				return nil, fmt.Errorf("failed to read part %s: %w", file.Name, readErr)
+			}
+			part.content = data
+		}
+		pkg.parts[normalizedPath] = part
 	}
 
 	return pkg, nil
@@ -521,6 +826,11 @@ type packageBase struct {
 	originURI     string                    // normalized path to origin part
 	readWrite     bool
 	nextRelID     int
+	archiveReader *zip.Reader
+	readerOptions readerOptions
+	ownedCloser   io.Closer
+	closed        bool
+	closeErr      error
 	mu            sync.RWMutex
 }
 
@@ -532,6 +842,20 @@ func newPackageBase(path string, stream io.ReadWriteSeeker) *packageBase {
 		relationships: make(map[string][]relationship),
 		nextRelID:     1,
 	}
+}
+
+func (pkg *packageBase) close() error {
+	pkg.mu.Lock()
+	defer pkg.mu.Unlock()
+	if pkg.closed {
+		return pkg.closeErr
+	}
+	pkg.closed = true
+	if pkg.ownedCloser != nil {
+		pkg.closeErr = pkg.ownedCloser.Close()
+		pkg.ownedCloser = nil
+	}
+	return pkg.closeErr
 }
 
 func (pkg *packageBase) addRelationship(sourcePath, targetPath, relType string) string {
@@ -611,9 +935,12 @@ type PackageRead struct {
 
 // Close closes the package and releases all resources.
 func (p *PackageRead) Close() error {
-	// Clear references
+	if p == nil || p.base == nil {
+		return nil
+	}
+	err := p.base.close()
 	p.base = nil
-	return nil
+	return err
 }
 
 // Specs returns all AAS spec parts contained in the package.
@@ -1225,6 +1552,12 @@ func (p *PackageReadWrite) buildContentTypes() contentTypesXML {
 // endregion
 
 // region Helper Functions
+
+func isOPCMetadataPath(zipPath string) bool {
+	zipPath = strings.ReplaceAll(zipPath, "\\", "/")
+	return zipPath == "[Content_Types].xml" ||
+		(strings.Contains(zipPath, "_rels/") && strings.HasSuffix(zipPath, ".rels"))
+}
 
 // normalizeURI returns a normalized string representation of a URI for use as map key
 func normalizeURI(uri *url.URL) string {
