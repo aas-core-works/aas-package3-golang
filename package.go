@@ -181,6 +181,7 @@ type boundedReadCloser struct {
 	stream    io.ReadCloser
 	remaining uint64
 	label     string
+	limitErr  error
 }
 
 func (reader *boundedReadCloser) Read(buffer []byte) (int, error) {
@@ -192,11 +193,18 @@ func (reader *boundedReadCloser) Read(buffer []byte) (int, error) {
 		var probe [1]byte
 		read, err := reader.stream.Read(probe[:])
 		if read > 0 {
-			return 0, fmt.Errorf("%w: %s", ErrReaderLimitExceeded, reader.label)
+			limitErr := reader.limitErr
+			if limitErr == nil {
+				limitErr = ErrReaderLimitExceeded
+			}
+			return 0, fmt.Errorf("%w: %s", limitErr, reader.label)
 		}
 		return 0, err
 	}
 
+	if len(buffer) > streamCopyBufferSize {
+		buffer = buffer[:streamCopyBufferSize]
+	}
 	if uint64(len(buffer)) > reader.remaining {
 		buffer = buffer[:int(reader.remaining)]
 	}
@@ -310,12 +318,11 @@ func (p *Part) Stream() (io.ReadCloser, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open part %s: %w", p.URI.String(), err)
 		}
-		if p.pkg.readerOptions.maxPartExpandedBytes != 0 {
-			stream = &boundedReadCloser{
-				stream:    stream,
-				remaining: p.pkg.readerOptions.maxPartExpandedBytes,
-				label:     fmt.Sprintf("part %s exceeds the expanded-size limit", p.URI.String()),
-			}
+		stream = &boundedReadCloser{
+			stream:    stream,
+			remaining: p.archiveFile.UncompressedSize64,
+			label:     fmt.Sprintf("part %s exceeds its declared expanded size", p.URI.String()),
+			limitErr:  zip.ErrFormat,
 		}
 		return stream, nil
 	}
@@ -644,14 +651,24 @@ func (p *Packaging) openPackage(
 	}
 
 	pkg := newPackageBase(path, nil)
-	pkg.archiveReader = zipReader
 	pkg.readerOptions = options
 
 	var partCount uint64
 	var totalExpanded uint64
+	entryPaths := make(map[string]string)
 	for _, file := range zipReader.File {
-		if strings.HasSuffix(file.Name, "/") {
+		if isZIPDirectory(file) {
 			continue
+		}
+		canonicalPath := normalizePathForMap(file.Name)
+		if previous, exists := entryPaths[canonicalPath]; exists {
+			return nil, fmt.Errorf(
+				"%w: duplicate ZIP entries %q and %q", ErrInvalidFormat, previous, file.Name)
+		}
+		entryPaths[canonicalPath] = file.Name
+		if isReservedOPCPath(file.Name) && !isOPCMetadataPath(file.Name) {
+			return nil, fmt.Errorf(
+				"%w: invalid entry in reserved OPC location: %s", ErrInvalidFormat, file.Name)
 		}
 		partCount++
 		if options.maxPartCount != 0 && partCount > options.maxPartCount {
@@ -711,7 +728,7 @@ func (p *Packaging) openPackage(
 	contentTypes := make(map[string]string) // path -> contentType
 	defaultTypes := make(map[string]string) // extension -> contentType
 	for _, file := range zipReader.File {
-		if file.Name == "[Content_Types].xml" {
+		if isContentTypesPath(file.Name) {
 			data, err := readMetadata(file, "OPC content types")
 			if err != nil {
 				return nil, fmt.Errorf("failed to read content types: %w", err)
@@ -735,7 +752,7 @@ func (p *Packaging) openPackage(
 	// Read all relationships files
 	for _, file := range zipReader.File {
 		relsPath := strings.ReplaceAll(file.Name, "\\", "/")
-		if strings.Contains(relsPath, "_rels/") && strings.HasSuffix(relsPath, ".rels") {
+		if isRelationshipPartPath(relsPath) {
 			data, err := readMetadata(file, fmt.Sprintf("relationship part %s", file.Name))
 			if err != nil {
 				return nil, fmt.Errorf("failed to read rels file %s: %w", file.Name, err)
@@ -769,9 +786,7 @@ func (p *Packaging) openPackage(
 	// Read all parts (excluding rels files and content types)
 	for _, file := range zipReader.File {
 		zipPath := strings.ReplaceAll(file.Name, "\\", "/")
-		if zipPath == "[Content_Types].xml" ||
-			strings.Contains(zipPath, "_rels/") ||
-			strings.HasSuffix(zipPath, "/") {
+		if isOPCMetadataPath(zipPath) || isZIPDirectory(file) {
 			continue
 		}
 
@@ -826,7 +841,6 @@ type packageBase struct {
 	originURI     string                    // normalized path to origin part
 	readWrite     bool
 	nextRelID     int
-	archiveReader *zip.Reader
 	readerOptions readerOptions
 	ownedCloser   io.Closer
 	closed        bool
@@ -938,22 +952,49 @@ func (p *PackageRead) Close() error {
 	if p == nil || p.base == nil {
 		return nil
 	}
-	err := p.base.close()
-	p.base = nil
-	return err
+	return p.base.close()
+}
+
+func (p *PackageRead) lockBaseForRead() (*packageBase, error) {
+	if p == nil || p.base == nil {
+		return nil, ErrPackageClosed
+	}
+	base := p.base
+	base.mu.RLock()
+	if base.closed {
+		base.mu.RUnlock()
+		return nil, ErrPackageClosed
+	}
+	return base, nil
+}
+
+func (p *PackageRead) lockBaseForWrite() (*packageBase, error) {
+	if p == nil || p.base == nil {
+		return nil, ErrPackageClosed
+	}
+	base := p.base
+	base.mu.Lock()
+	if base.closed {
+		base.mu.Unlock()
+		return nil, ErrPackageClosed
+	}
+	return base, nil
 }
 
 // Specs returns all AAS spec parts contained in the package.
 func (p *PackageRead) Specs() ([]*Part, error) {
-	p.base.mu.RLock()
-	defer p.base.mu.RUnlock()
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return nil, err
+	}
+	defer base.mu.RUnlock()
 
 	var result []*Part
-	rels := p.base.getRelationshipsByType(p.base.originURI, RelationTypeAasxSpec)
+	rels := base.getRelationshipsByType(base.originURI, RelationTypeAasxSpec)
 
 	for _, rel := range rels {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if part, ok := p.base.parts[normalizedTarget]; ok {
+		if part, ok := base.parts[normalizedTarget]; ok {
 			result = append(result, part)
 		}
 	}
@@ -992,23 +1033,29 @@ func (p *PackageRead) SpecsByContentType() (map[string][]*Part, error) {
 
 // IsSpec checks whether the given part is related to the origin of the package as a spec.
 func (p *PackageRead) IsSpec(part *Part) (bool, error) {
-	p.base.mu.RLock()
-	defer p.base.mu.RUnlock()
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return false, err
+	}
+	defer base.mu.RUnlock()
 
-	return p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec), nil
+	return base.hasRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec), nil
 }
 
 // SupplementariesFor returns all supplementary parts for the given spec.
 func (p *PackageRead) SupplementariesFor(spec *Part) ([]*Part, error) {
-	p.base.mu.RLock()
-	defer p.base.mu.RUnlock()
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return nil, err
+	}
+	defer base.mu.RUnlock()
 
 	var result []*Part
-	rels := p.base.getRelationshipsByType(spec.URI.String(), RelationTypeAasxSupplementary)
+	rels := base.getRelationshipsByType(spec.URI.String(), RelationTypeAasxSupplementary)
 
 	for _, rel := range rels {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if part, ok := p.base.parts[normalizedTarget]; ok {
+		if part, ok := base.parts[normalizedTarget]; ok {
 			result = append(result, part)
 		} else {
 			return nil, fmt.Errorf("supplementary part %s not found", rel.target)
@@ -1045,11 +1092,14 @@ func (p *PackageRead) SupplementaryRelationships() ([]*SupplementaryRelationship
 // FindPart tries to find the package part with the given URI.
 // Returns nil if the part does not exist.
 func (p *PackageRead) FindPart(uri *url.URL) (*Part, error) {
-	p.base.mu.RLock()
-	defer p.base.mu.RUnlock()
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return nil, err
+	}
+	defer base.mu.RUnlock()
 
 	normalizedURI := normalizeURI(uri)
-	if part, ok := p.base.parts[normalizedURI]; ok {
+	if part, ok := base.parts[normalizedURI]; ok {
 		return part, nil
 	}
 	return nil, nil
@@ -1071,16 +1121,19 @@ func (p *PackageRead) MustPart(uri *url.URL) (*Part, error) {
 // Thumbnail retrieves the thumbnail from the AAS package.
 // Returns nil if no thumbnail exists in the package.
 func (p *PackageRead) Thumbnail() (*Part, error) {
-	p.base.mu.RLock()
-	defer p.base.mu.RUnlock()
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return nil, err
+	}
+	defer base.mu.RUnlock()
 
 	// Look for thumbnail relationship from root
-	rels := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	rels := base.getRelationshipsByType("", RelationTypeThumbnail)
 
 	if len(rels) > 0 {
 		rel := rels[0]
 		normalizedTarget := normalizePathForMap(rel.target)
-		if part, ok := p.base.parts[normalizedTarget]; ok {
+		if part, ok := base.parts[normalizedTarget]; ok {
 			return part, nil
 		}
 		return nil, fmt.Errorf("thumbnail relationship exists but part not found: %s", rel.target)
@@ -1415,8 +1468,11 @@ func (p *PackageReadWrite) PutPart(
 	contentType string,
 	content []byte,
 ) (*Part, error) {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer base.mu.Unlock()
 
 	normalizedURI := normalizeURI(uri)
 
@@ -1428,12 +1484,12 @@ func (p *PackageReadWrite) PutPart(
 		URI:         uri,
 		ContentType: contentType,
 		content:     contentCopy,
-		pkg:         p.base,
+		pkg:         base,
 	}
 
-	p.base.parts[normalizedURI] = part
+	base.parts[normalizedURI] = part
 
-	stored := p.base.parts[normalizedURI]
+	stored := base.parts[normalizedURI]
 	Ensure(stored != nil, "The part should be included in the package.")
 	if stored != nil {
 		Ensure(
@@ -1450,6 +1506,12 @@ func (p *PackageReadWrite) PutPartFromStream(
 	contentType string,
 	stream io.Reader,
 ) (*Part, error) {
+	base, err := p.lockBaseForRead()
+	if err != nil {
+		return nil, err
+	}
+	base.mu.RUnlock()
+
 	content, err := io.ReadAll(stream)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read stream: %w", err)
@@ -1459,13 +1521,16 @@ func (p *PackageReadWrite) PutPartFromStream(
 
 // DeletePart removes a part from the package.
 func (p *PackageReadWrite) DeletePart(part *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
 	normalizedURI := normalizeURI(part.URI)
-	delete(p.base.parts, normalizedURI)
+	delete(base.parts, normalizedURI)
 
-	_, exists := p.base.parts[normalizedURI]
+	_, exists := base.parts[normalizedURI]
 	Ensure(!exists, "The part should not exist in the package anymore.")
 
 	return nil
@@ -1473,56 +1538,62 @@ func (p *PackageReadWrite) DeletePart(part *Part) error {
 
 // MakeSpec relates the given part to the origin as a spec.
 func (p *PackageReadWrite) MakeSpec(part *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
 	// Check if relationship already exists
-	if p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec) {
+	if base.hasRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec) {
 		return nil
 	}
 
-	p.base.addRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	base.addRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec)
 
-	listed := p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	listed := base.hasRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec)
 	if listed {
-		_, exists := p.base.parts[normalizeURI(part.URI)]
+		_, exists := base.parts[normalizeURI(part.URI)]
 		listed = exists
 	}
 	Ensure(listed, "Spec must be listed.")
 
-	isSpec := p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	isSpec := base.hasRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec)
 	Ensure(isSpec, "The part fulfills the spec property.")
 	return nil
 }
 
 // UnmakeSpec removes the spec relationship for the given part.
 func (p *PackageReadWrite) UnmakeSpec(part *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
-	isSpec := p.base.hasRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	isSpec := base.hasRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec)
 	Require(isSpec, "The part fulfills the spec property.")
 
 	oldSpecURISet := make(map[string]struct{})
-	for _, rel := range p.base.getRelationshipsByType(
-		p.base.originURI,
+	for _, rel := range base.getRelationshipsByType(
+		base.originURI,
 		RelationTypeAasxSpec,
 	) {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if _, ok := p.base.parts[normalizedTarget]; ok {
+		if _, ok := base.parts[normalizedTarget]; ok {
 			oldSpecURISet[normalizedTarget] = struct{}{}
 		}
 	}
 
-	p.base.removeRelationship(p.base.originURI, part.URI.String(), RelationTypeAasxSpec)
+	base.removeRelationship(base.originURI, part.URI.String(), RelationTypeAasxSpec)
 
 	newSpecURISet := make(map[string]struct{})
-	for _, rel := range p.base.getRelationshipsByType(
-		p.base.originURI,
+	for _, rel := range base.getRelationshipsByType(
+		base.originURI,
 		RelationTypeAasxSpec,
 	) {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if _, ok := p.base.parts[normalizedTarget]; ok {
+		if _, ok := base.parts[normalizedTarget]; ok {
 			newSpecURISet[normalizedTarget] = struct{}{}
 		}
 	}
@@ -1552,14 +1623,17 @@ func (p *PackageReadWrite) UnmakeSpec(part *Part) error {
 func (p *PackageReadWrite) RelateSupplementaryToSpec(
 	supplementary *Part,
 	spec *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
-	isSpec := p.base.hasRelationship(p.base.originURI, spec.URI.String(), RelationTypeAasxSpec)
+	isSpec := base.hasRelationship(base.originURI, spec.URI.String(), RelationTypeAasxSpec)
 	Require(isSpec, "The part fulfills the spec property.")
 
 	// Check if relationship already exists
-	if p.base.hasRelationship(
+	if base.hasRelationship(
 		spec.URI.String(),
 		supplementary.URI.String(),
 		RelationTypeAasxSupplementary,
@@ -1567,17 +1641,17 @@ func (p *PackageReadWrite) RelateSupplementaryToSpec(
 		return nil
 	}
 
-	p.base.addRelationship(
+	base.addRelationship(
 		spec.URI.String(),
 		supplementary.URI.String(),
 		RelationTypeAasxSupplementary)
 
-	relExists := p.base.hasRelationship(
+	relExists := base.hasRelationship(
 		spec.URI.String(),
 		supplementary.URI.String(),
 		RelationTypeAasxSupplementary)
 	if relExists {
-		_, exists := p.base.parts[normalizeURI(supplementary.URI)]
+		_, exists := base.parts[normalizeURI(supplementary.URI)]
 		relExists = exists
 	}
 	Ensure(relExists, "The supplementary must be listed.")
@@ -1586,35 +1660,38 @@ func (p *PackageReadWrite) RelateSupplementaryToSpec(
 
 // UnrelateSupplementaryFromSpec removes the supplementary relationship.
 func (p *PackageReadWrite) UnrelateSupplementaryFromSpec(supplementary *Part, spec *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
-	isSpec := p.base.hasRelationship(p.base.originURI, spec.URI.String(), RelationTypeAasxSpec)
+	isSpec := base.hasRelationship(base.originURI, spec.URI.String(), RelationTypeAasxSpec)
 	Require(isSpec, "The part fulfills the spec property.")
 
 	oldSupplURISet := make(map[string]struct{})
-	for _, rel := range p.base.getRelationshipsByType(
+	for _, rel := range base.getRelationshipsByType(
 		spec.URI.String(),
 		RelationTypeAasxSupplementary,
 	) {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if _, ok := p.base.parts[normalizedTarget]; ok {
+		if _, ok := base.parts[normalizedTarget]; ok {
 			oldSupplURISet[normalizedTarget] = struct{}{}
 		}
 	}
 
-	p.base.removeRelationship(
+	base.removeRelationship(
 		spec.URI.String(),
 		supplementary.URI.String(),
 		RelationTypeAasxSupplementary)
 
 	newSupplURISet := make(map[string]struct{})
-	for _, rel := range p.base.getRelationshipsByType(
+	for _, rel := range base.getRelationshipsByType(
 		spec.URI.String(),
 		RelationTypeAasxSupplementary,
 	) {
 		normalizedTarget := normalizePathForMap(rel.target)
-		if _, ok := p.base.parts[normalizedTarget]; ok {
+		if _, ok := base.parts[normalizedTarget]; ok {
 			newSupplURISet[normalizedTarget] = struct{}{}
 		}
 	}
@@ -1645,23 +1722,26 @@ func (p *PackageReadWrite) UnrelateSupplementaryFromSpec(supplementary *Part, sp
 
 // SetThumbnail sets the thumbnail of the package.
 func (p *PackageReadWrite) SetThumbnail(part *Part) error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
 	// First remove any existing thumbnail relationship
-	rels := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	rels := base.getRelationshipsByType("", RelationTypeThumbnail)
 	for _, rel := range rels {
-		p.base.removeRelationship("", rel.target, RelationTypeThumbnail)
+		base.removeRelationship("", rel.target, RelationTypeThumbnail)
 	}
 
 	// Add new thumbnail relationship
-	p.base.addRelationship("", part.URI.String(), RelationTypeThumbnail)
+	base.addRelationship("", part.URI.String(), RelationTypeThumbnail)
 
-	thumbnailRels := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	thumbnailRels := base.getRelationshipsByType("", RelationTypeThumbnail)
 	Ensure(len(thumbnailRels) > 0, "The thumbnail must be available.")
 	if len(thumbnailRels) > 0 {
 		normalizedTarget := normalizePathForMap(thumbnailRels[0].target)
-		stored, exists := p.base.parts[normalizedTarget]
+		stored, exists := base.parts[normalizedTarget]
 		Ensure(exists, "The thumbnail must point to the part.")
 		if exists {
 			Ensure(
@@ -1674,23 +1754,29 @@ func (p *PackageReadWrite) SetThumbnail(part *Part) error {
 
 // UnsetThumbnail removes the thumbnail from the package.
 func (p *PackageReadWrite) UnsetThumbnail() error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
-	rels := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	rels := base.getRelationshipsByType("", RelationTypeThumbnail)
 	for _, rel := range rels {
-		p.base.removeRelationship("", rel.target, RelationTypeThumbnail)
+		base.removeRelationship("", rel.target, RelationTypeThumbnail)
 	}
 
-	remaining := p.base.getRelationshipsByType("", RelationTypeThumbnail)
+	remaining := base.getRelationshipsByType("", RelationTypeThumbnail)
 	Ensure(len(remaining) == 0, "The thumbnail must not exist any more")
 	return nil
 }
 
 // Flush writes all pending changes to the underlying stream or file.
 func (p *PackageReadWrite) Flush() error {
-	p.base.mu.Lock()
-	defer p.base.mu.Unlock()
+	base, err := p.lockBaseForWrite()
+	if err != nil {
+		return err
+	}
+	defer base.mu.Unlock()
 
 	// Create the zip content in memory
 	var buf bytes.Buffer
@@ -1703,11 +1789,11 @@ func (p *PackageReadWrite) Flush() error {
 		if err := os.WriteFile(p.Path, buf.Bytes(), 0644); err != nil {
 			return fmt.Errorf("failed to write file: %w", err)
 		}
-	} else if p.base.stream != nil {
-		if _, err := p.base.stream.Seek(0, io.SeekStart); err != nil {
+	} else if base.stream != nil {
+		if _, err := base.stream.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("failed to seek stream: %w", err)
 		}
-		if _, err := p.base.stream.Write(buf.Bytes()); err != nil {
+		if _, err := base.stream.Write(buf.Bytes()); err != nil {
 			return fmt.Errorf("failed to write stream: %w", err)
 		}
 	}
@@ -1865,10 +1951,39 @@ func buildContentTypes(parts map[string]*Part) contentTypesXML {
 
 // region Helper Functions
 
+func isZIPDirectory(file *zip.File) bool {
+	return file.FileInfo().IsDir() || strings.HasSuffix(strings.ReplaceAll(file.Name, "\\", "/"), "/")
+}
+
+func isContentTypesPath(zipPath string) bool {
+	return normalizePathForMap(zipPath) == normalizePathForMap("/[Content_Types].xml")
+}
+
+func isRelationshipPartPath(zipPath string) bool {
+	normalized := strings.TrimPrefix(normalizePathForURI(zipPath), "/")
+	directory := pathpkg.Dir(normalized)
+	base := pathpkg.Base(normalized)
+	if pathpkg.Base(directory) != "_rels" || !strings.HasSuffix(base, ".rels") {
+		return false
+	}
+	return base != ".rels" || directory == "_rels"
+}
+
+func isReservedOPCPath(zipPath string) bool {
+	if isContentTypesPath(zipPath) {
+		return true
+	}
+	normalized := strings.TrimPrefix(normalizePathForMap(zipPath), "/")
+	for _, segment := range strings.Split(normalized, "/") {
+		if segment == "_rels" {
+			return true
+		}
+	}
+	return false
+}
+
 func isOPCMetadataPath(zipPath string) bool {
-	zipPath = strings.ReplaceAll(zipPath, "\\", "/")
-	return zipPath == "[Content_Types].xml" ||
-		(strings.Contains(zipPath, "_rels/") && strings.HasSuffix(zipPath, ".rels"))
+	return isContentTypesPath(zipPath) || isRelationshipPartPath(zipPath)
 }
 
 func checkedExpandedTotal(total uint64, size uint64) (uint64, error) {

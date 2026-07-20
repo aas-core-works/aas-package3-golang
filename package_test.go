@@ -3,6 +3,7 @@ package aasx
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/binary"
 	"encoding/xml"
 	"errors"
 	"io"
@@ -49,6 +50,25 @@ type failingRangeReaderAt struct {
 	reader  *bytes.Reader
 	blocked byteRange
 	err     error
+}
+
+type observingRangeReaderAt struct {
+	reader      *bytes.Reader
+	observed    byteRange
+	maxReadSize int
+	mu          sync.Mutex
+}
+
+func (reader *observingRangeReaderAt) ReadAt(buffer []byte, offset int64) (int, error) {
+	end := offset + int64(len(buffer))
+	if offset < reader.observed.end && end > reader.observed.start {
+		reader.mu.Lock()
+		if len(buffer) > reader.maxReadSize {
+			reader.maxReadSize = len(buffer)
+		}
+		reader.mu.Unlock()
+	}
+	return reader.reader.ReadAt(buffer, offset)
 }
 
 func (reader *failingRangeReaderAt) ReadAt(buffer []byte, offset int64) (int, error) {
@@ -201,6 +221,85 @@ func lazyTestPackage(t *testing.T) ([]byte, map[string]byteRange) {
 		}
 	}
 	return output.Bytes(), ranges
+}
+
+type testZIPEntry struct {
+	name    string
+	content []byte
+	mode    os.FileMode
+}
+
+func testPackageWithEntries(t *testing.T, entries []testZIPEntry) []byte {
+	t.Helper()
+
+	var output bytes.Buffer
+	writer := zip.NewWriter(&output)
+	writeEntry := func(entry testZIPEntry) {
+		t.Helper()
+		header := &zip.FileHeader{Name: entry.name, Method: zip.Store}
+		if entry.mode != 0 {
+			header.SetMode(entry.mode)
+		}
+		part, err := writer.CreateHeader(header)
+		if err != nil {
+			t.Fatalf("Failed to create %s: %v", entry.name, err)
+		}
+		if _, err := part.Write(entry.content); err != nil {
+			t.Fatalf("Failed to write %s: %v", entry.name, err)
+		}
+	}
+
+	writeEntry(testZIPEntry{name: "aasx/aasx-origin", content: []byte("Intentionally empty.")})
+	writeEntry(testZIPEntry{
+		name: "[Content_Types].xml",
+		content: []byte(xml.Header + `<Types xmlns="` + opcContentTypesNamespace +
+			`"><Default Extension="bin" ContentType="application/octet-stream"/>` +
+			`<Default Extension="rels" ContentType="application/xml"/>` +
+			`<Override PartName="/aasx/aasx-origin" ContentType="text/plain"/></Types>`),
+	})
+	writeEntry(testZIPEntry{
+		name: "_rels/.rels",
+		content: []byte(xml.Header + `<Relationships xmlns="` + opcRelationshipNamespace +
+			`"><Relationship Id="R1" Type="` + RelationTypeAasxOrigin +
+			`" Target="/aasx/aasx-origin"/></Relationships>`),
+	})
+	for _, entry := range entries {
+		writeEntry(entry)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close test ZIP: %v", err)
+	}
+	return output.Bytes()
+}
+
+func rewriteCentralDirectoryExpandedSize(
+	t *testing.T,
+	data []byte,
+	name string,
+	size uint32,
+) []byte {
+	t.Helper()
+	result := append([]byte(nil), data...)
+	for offset := 0; offset+46 <= len(result); offset++ {
+		if binary.LittleEndian.Uint32(result[offset:]) != 0x02014b50 {
+			continue
+		}
+		nameLength := int(binary.LittleEndian.Uint16(result[offset+28:]))
+		extraLength := int(binary.LittleEndian.Uint16(result[offset+30:]))
+		commentLength := int(binary.LittleEndian.Uint16(result[offset+32:]))
+		end := offset + 46 + nameLength + extraLength + commentLength
+		if end > len(result) {
+			t.Fatal("Malformed central directory in test ZIP")
+		}
+		entryName := string(result[offset+46 : offset+46+nameLength])
+		if entryName == name {
+			binary.LittleEndian.PutUint32(result[offset+24:], size)
+			return result
+		}
+		offset = end - 1
+	}
+	t.Fatalf("ZIP entry %s not found in central directory", name)
+	return nil
 }
 
 func relationshipTypesInZip(t *testing.T, zipData []byte) []string {
@@ -521,6 +620,222 @@ func TestLazyReaderLimits(t *testing.T) {
 		WithMaxTotalExpandedBytes(0),
 	); err != nil {
 		t.Fatalf("Zero limits should be unlimited: %v", err)
+	}
+}
+
+func TestLazyReaderClassifiesOPCPathsExactly(t *testing.T) {
+	payload := bytes.Repeat([]byte("not XML"), 1024)
+	data := testPackageWithEntries(t, []testZIPEntry{
+		{name: "attacker_rels/bomb.rels", content: payload},
+		{name: "foo_rels/data.bin", content: []byte("visible")},
+	})
+
+	packaging := NewPackaging()
+	if _, err := packaging.OpenReadFromReaderAt(
+		bytes.NewReader(data), int64(len(data)), WithMaxPartExpandedBytes(64),
+	); !errors.Is(err, ErrReaderLimitExceeded) {
+		t.Fatalf("Near-match relationship path bypassed payload limit: %v", err)
+	}
+
+	pkg, err := packaging.OpenReadFromReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to open package with near-match paths: %v", err)
+	}
+	defer pkg.Close()
+	part, err := pkg.MustPart(mustParseURL("/foo_rels/data.bin"))
+	if err != nil {
+		t.Fatalf("Near-match payload was hidden: %v", err)
+	}
+	content, err := part.ReadAllBytes()
+	if err != nil || string(content) != "visible" {
+		t.Fatalf("Unexpected near-match payload content %q: %v", content, err)
+	}
+
+	reserved := testPackageWithEntries(t, []testZIPEntry{
+		{name: "_rels/data.bin", content: []byte("reserved")},
+	})
+	if _, err := packaging.OpenReadFromReaderAt(
+		bytes.NewReader(reserved), int64(len(reserved)),
+	); !errors.Is(err, ErrInvalidFormat) {
+		t.Fatalf("Expected invalid-format error for reserved OPC path, got %v", err)
+	}
+}
+
+func TestLazyReaderRejectsDuplicateCanonicalEntries(t *testing.T) {
+	testCases := []struct {
+		name    string
+		entries []testZIPEntry
+	}{
+		{
+			name: "same name",
+			entries: []testZIPEntry{
+				{name: "data.bin", content: []byte("first")},
+				{name: "data.bin", content: []byte("second")},
+			},
+		},
+		{
+			name: "case alias",
+			entries: []testZIPEntry{
+				{name: "Data.bin", content: []byte("first")},
+				{name: "data.bin", content: []byte("second")},
+			},
+		},
+		{
+			name: "clean path alias",
+			entries: []testZIPEntry{
+				{name: "folder/../data.bin", content: []byte("first")},
+				{name: "data.bin", content: []byte("second")},
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			data := testPackageWithEntries(t, testCase.entries)
+			_, err := NewPackaging().OpenReadFromReaderAt(
+				bytes.NewReader(data), int64(len(data)))
+			if !errors.Is(err, ErrInvalidFormat) {
+				t.Fatalf("Expected duplicate-entry format error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLazyReaderUsesFixedReadChunksAndDeclaredSizeGuard(t *testing.T) {
+	data, ranges := lazyTestPackage(t)
+	reader := &observingRangeReaderAt{
+		reader:   bytes.NewReader(data),
+		observed: ranges["aasx/spec.bin"],
+	}
+	pkg, err := NewPackaging().OpenReadFromReaderAt(reader, int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to open package: %v", err)
+	}
+	defer pkg.Close()
+	part, err := pkg.MustPart(mustParseURL("/aasx/spec.bin"))
+	if err != nil {
+		t.Fatalf("Failed to find spec: %v", err)
+	}
+	if _, err := part.ReadAllBytes(); err != nil {
+		t.Fatalf("Failed to read spec: %v", err)
+	}
+	if reader.maxReadSize > streamCopyBufferSize {
+		t.Fatalf("Payload read request was %d bytes, maximum is %d",
+			reader.maxReadSize, streamCopyBufferSize)
+	}
+
+	malformed := testPackageWithEntries(t, []testZIPEntry{
+		{name: "oversized.bin", content: bytes.Repeat([]byte{0x7f}, 64*1024)},
+	})
+	malformed = rewriteCentralDirectoryExpandedSize(t, malformed, "oversized.bin", 1)
+	pkg, err = NewPackaging().OpenReadFromReaderAt(
+		bytes.NewReader(malformed), int64(len(malformed)), WithMaxTotalExpandedBytes(64))
+	if err != nil {
+		t.Fatalf("Declared-size package should open before payload consumption: %v", err)
+	}
+	defer pkg.Close()
+	part, err = pkg.MustPart(mustParseURL("/oversized.bin"))
+	if err != nil {
+		t.Fatalf("Failed to find malformed part: %v", err)
+	}
+	content, err := part.ReadAllBytes()
+	if !errors.Is(err, zip.ErrFormat) {
+		t.Fatalf("Expected expanded-size format error, got %v", err)
+	}
+	if len(content) > 1 {
+		t.Fatalf("Read %d bytes beyond declared expanded size", len(content))
+	}
+}
+
+func TestLazyReaderIgnoresModeDirectoriesForPartLimits(t *testing.T) {
+	data := testPackageWithEntries(t, []testZIPEntry{
+		{name: "mode-directory", mode: os.ModeDir | 0755},
+	})
+	pkg, err := NewPackaging().OpenReadFromReaderAt(
+		bytes.NewReader(data), int64(len(data)), WithMaxPartCount(3))
+	if err != nil {
+		t.Fatalf("Mode-only directory counted as a part: %v", err)
+	}
+	defer pkg.Close()
+	part, err := pkg.FindPart(mustParseURL("/mode-directory"))
+	if err != nil {
+		t.Fatalf("Failed to query mode-only directory: %v", err)
+	}
+	if part != nil {
+		t.Fatal("Mode-only directory was exposed as a payload part")
+	}
+}
+
+func TestPackageReadOperationsAfterClose(t *testing.T) {
+	data, _ := lazyTestPackage(t)
+	pkg, err := NewPackaging().OpenReadFromReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to open package: %v", err)
+	}
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Repeated close failed: %v", err)
+	}
+
+	operations := []func() error{
+		func() error { _, operationErr := pkg.Specs(); return operationErr },
+		func() error { _, operationErr := pkg.SpecsByContentType(); return operationErr },
+		func() error { _, operationErr := pkg.IsSpec(specs[0]); return operationErr },
+		func() error { _, operationErr := pkg.SupplementariesFor(specs[0]); return operationErr },
+		func() error { _, operationErr := pkg.SupplementaryRelationships(); return operationErr },
+		func() error { _, operationErr := pkg.FindPart(specs[0].URI); return operationErr },
+		func() error { _, operationErr := pkg.MustPart(specs[0].URI); return operationErr },
+		func() error { _, operationErr := pkg.Thumbnail(); return operationErr },
+		func() error { _, operationErr := specs[0].Stream(); return operationErr },
+	}
+	for index, operation := range operations {
+		if err := operation(); !errors.Is(err, ErrPackageClosed) {
+			t.Errorf("Operation %d: expected ErrPackageClosed, got %v", index, err)
+		}
+	}
+}
+
+func TestPackageReadCloseRetainsErrorAndSynchronizesQueries(t *testing.T) {
+	closeErr := errors.New("close failed")
+	base := newPackageBase("", nil)
+	base.ownedCloser = &closeErrorReadCloser{Reader: bytes.NewReader(nil), err: closeErr}
+	pkg := &PackageRead{base: base}
+	if err := pkg.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("Expected close error, got %v", err)
+	}
+	if err := pkg.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("Repeated Close lost original error: %v", err)
+	}
+
+	data, _ := lazyTestPackage(t)
+	for iteration := 0; iteration < 50; iteration++ {
+		concurrent, err := NewPackaging().OpenReadFromReaderAt(
+			bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatalf("Failed to open concurrent package: %v", err)
+		}
+		var waitGroup sync.WaitGroup
+		waitGroup.Add(2)
+		go func() {
+			defer waitGroup.Done()
+			_, queryErr := concurrent.Specs()
+			if queryErr != nil && !errors.Is(queryErr, ErrPackageClosed) {
+				t.Errorf("Unexpected concurrent query error: %v", queryErr)
+			}
+		}()
+		go func() {
+			defer waitGroup.Done()
+			if closeOperationErr := concurrent.Close(); closeOperationErr != nil {
+				t.Errorf("Unexpected concurrent close error: %v", closeOperationErr)
+			}
+		}()
+		waitGroup.Wait()
 	}
 }
 
@@ -2125,6 +2440,51 @@ func TestPackageWriterPropagatesAndRetainsFailures(t *testing.T) {
 // =============================================================================
 // TestPackageReadWrite (Create)
 // =============================================================================
+
+func TestPackageReadWriteOperationsAfterClose(t *testing.T) {
+	var destination bytes.Buffer
+	pkg, err := NewPackaging().CreateInStream(&readWriteSeeker{buf: &destination})
+	if err != nil {
+		t.Fatalf("Failed to create package: %v", err)
+	}
+	part, err := pkg.PutPart(
+		mustParseURL("/part.bin"), "application/octet-stream", []byte("part"))
+	if err != nil {
+		t.Fatalf("Failed to add part: %v", err)
+	}
+	if err := pkg.MakeSpec(part); err != nil {
+		t.Fatalf("Failed to make spec: %v", err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatalf("Failed to close package: %v", err)
+	}
+
+	operations := []func() error{
+		func() error {
+			_, operationErr := pkg.PutPart(
+				mustParseURL("/late.bin"), "application/octet-stream", nil)
+			return operationErr
+		},
+		func() error {
+			_, operationErr := pkg.PutPartFromStream(
+				mustParseURL("/late-stream.bin"), "application/octet-stream", bytes.NewReader(nil))
+			return operationErr
+		},
+		func() error { return pkg.DeletePart(part) },
+		func() error { return pkg.MakeSpec(part) },
+		func() error { return pkg.UnmakeSpec(part) },
+		func() error { return pkg.RelateSupplementaryToSpec(part, part) },
+		func() error { return pkg.UnrelateSupplementaryFromSpec(part, part) },
+		func() error { return pkg.SetThumbnail(part) },
+		func() error { return pkg.UnsetThumbnail() },
+		func() error { return pkg.Flush() },
+	}
+	for index, operation := range operations {
+		if err := operation(); !errors.Is(err, ErrPackageClosed) {
+			t.Errorf("Operation %d: expected ErrPackageClosed, got %v", index, err)
+		}
+	}
+}
 
 func TestCreateNewPackage(t *testing.T) {
 	tmpdir, cleanup := temporaryDirectory(t)
