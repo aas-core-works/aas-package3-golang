@@ -12,7 +12,28 @@ if err != nil {
 defer pkg.Close()
 ```
 
-The function returns an error if the package could not be opened (file not found, invalid format, etc.).
+The function parses the ZIP directory and OPC metadata, but leaves normal parts compressed
+until they are read. It returns errors for the file, ZIP directory, and OPC metadata while
+opening. Payload CRC, decompression, and truncation errors are returned later by the part
+stream or a `ReadAll` convenience method.
+
+`OpenRead` owns an open file until `Close`. Readers passed to `OpenReadFromReaderAt` or
+`OpenReadFromStream` remain caller-owned, but they must stay usable until the package is
+closed. Consume and close all part streams before closing the package.
+
+For untrusted packages, configure limits while opening:
+
+```go
+pkg, err := packaging.OpenRead(
+    "/path/to/some/file.aasx",
+    aasx.WithMaxPartCount(10_000),
+    aasx.WithMaxOPCMetadataBytes(16<<20),
+    aasx.WithMaxPartExpandedBytes(1<<30),
+    aasx.WithMaxTotalExpandedBytes(4<<30),
+)
+```
+
+A zero limit means unlimited, which is the default.
 
 ## Parts
 
@@ -54,7 +75,7 @@ defer stream.Close()
 // Read from stream...
 ```
 
-If you open a stream, do not forget to close it yourself!
+If you open a stream, close it before closing the package.
 
 ### Specs
 

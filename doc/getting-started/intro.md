@@ -19,6 +19,7 @@ The `aasx` package provides the following key types:
 | `Packaging` | Factory for opening and creating AASX packages |
 | `PackageRead` | Read-only access to an AASX package |
 | `PackageReadWrite` | Read and write access to an AASX package |
+| `PackageWriter` | Append-only, bounded-memory package creation |
 | `Part` | Represents a part within an AASX package |
 
 ## Error Handling

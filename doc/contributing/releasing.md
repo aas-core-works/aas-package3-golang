@@ -39,7 +39,7 @@ Releases are created using Git tags:
 Go modules use Git tags for versioning. Users can then install specific versions:
 
 ```bash
-go get github.com/aas-core-works/aas-package3-golang@v1.2.3
+go get github.com/aas-core-works/aas-package3-golang/v2@v2.0.0
 ```
 
 For major versions 2 and above, the import path must include the version:

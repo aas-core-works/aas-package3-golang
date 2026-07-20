@@ -97,6 +97,28 @@ type switchFailWriter struct {
 	err    error
 }
 
+type closeErrorReadCloser struct {
+	io.Reader
+	err error
+}
+
+func (stream *closeErrorReadCloser) Close() error {
+	return stream.err
+}
+
+type testZipFile struct {
+	content  []byte
+	closeErr error
+}
+
+func (file testZipFile) open() (io.ReadCloser, error) {
+	return &closeErrorReadCloser{Reader: bytes.NewReader(file.content), err: file.closeErr}, nil
+}
+
+func (file testZipFile) uncompressedSize() uint64 {
+	return uint64(len(file.content))
+}
+
 func (writer *switchFailWriter) Write(buffer []byte) (int, error) {
 	if writer.fail {
 		return 0, writer.err
@@ -499,6 +521,54 @@ func TestLazyReaderLimits(t *testing.T) {
 		WithMaxTotalExpandedBytes(0),
 	); err != nil {
 		t.Fatalf("Zero limits should be unlimited: %v", err)
+	}
+}
+
+func TestLazyReaderDefersCRCFailureUntilPartRead(t *testing.T) {
+	data, ranges := lazyTestPackage(t)
+	corrupted := append([]byte(nil), data...)
+	specRange := ranges["aasx/spec.bin"]
+	corrupted[specRange.start] ^= 0xff
+
+	pkg, err := NewPackaging().OpenReadFromReaderAt(
+		bytes.NewReader(corrupted), int64(len(corrupted)))
+	if err != nil {
+		t.Fatalf("Payload CRC failure should be deferred until reading: %v", err)
+	}
+	defer pkg.Close()
+	specs, err := pkg.Specs()
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("Expected one spec, got %d: %v", len(specs), err)
+	}
+	if _, err := specs[0].ReadAllBytes(); !errors.Is(err, zip.ErrChecksum) {
+		t.Fatalf("Expected ZIP checksum error, got %v", err)
+	}
+}
+
+func TestLazyReaderPropagatesCloseErrorsAndSizeOverflow(t *testing.T) {
+	closeErr := errors.New("close failed")
+	if _, err := readZipFile(
+		testZipFile{content: []byte("metadata"), closeErr: closeErr},
+		0,
+		false,
+		"metadata",
+	); !errors.Is(err, closeErr) {
+		t.Fatalf("Expected metadata close error, got %v", err)
+	}
+
+	if _, err := checkedExpandedTotal(^uint64(0), 1); !errors.Is(
+		err, ErrReaderLimitExceeded,
+	) {
+		t.Fatalf("Expected expanded-size overflow error, got %v", err)
+	}
+
+	base := newPackageBase("", nil)
+	base.ownedCloser = &closeErrorReadCloser{Reader: bytes.NewReader(nil), err: closeErr}
+	if err := base.close(); !errors.Is(err, closeErr) {
+		t.Fatalf("Expected owned-reader close error, got %v", err)
+	}
+	if err := base.close(); !errors.Is(err, closeErr) {
+		t.Fatalf("Expected repeated close to retain error, got %v", err)
 	}
 }
 

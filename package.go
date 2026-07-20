@@ -674,10 +674,10 @@ func (p *Packaging) openPackage(
 				options.maxPartExpandedBytes,
 			)
 		}
-		if totalExpanded > ^uint64(0)-file.UncompressedSize64 {
-			return nil, fmt.Errorf("%w: total expanded size overflows uint64", ErrReaderLimitExceeded)
+		totalExpanded, err = checkedExpandedTotal(totalExpanded, file.UncompressedSize64)
+		if err != nil {
+			return nil, err
 		}
-		totalExpanded += file.UncompressedSize64
 		if options.maxTotalExpandedBytes != 0 &&
 			totalExpanded > options.maxTotalExpandedBytes {
 			return nil, fmt.Errorf(
@@ -1869,6 +1869,13 @@ func isOPCMetadataPath(zipPath string) bool {
 	zipPath = strings.ReplaceAll(zipPath, "\\", "/")
 	return zipPath == "[Content_Types].xml" ||
 		(strings.Contains(zipPath, "_rels/") && strings.HasSuffix(zipPath, ".rels"))
+}
+
+func checkedExpandedTotal(total uint64, size uint64) (uint64, error) {
+	if total > ^uint64(0)-size {
+		return 0, fmt.Errorf("%w: total expanded size overflows uint64", ErrReaderLimitExceeded)
+	}
+	return total + size, nil
 }
 
 // normalizeURI returns a normalized string representation of a URI for use as map key
